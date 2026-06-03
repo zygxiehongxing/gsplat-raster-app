@@ -1,0 +1,5 @@
+build/
+*.png
+camera_truth_*.json
+truth_cli_*.png
+capture_*.png
