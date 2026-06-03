@@ -139,7 +139,7 @@ bool saveCameraTruth(const std::string& path, const CameraTruth& truth) {
     writeArrayF(out, "proj", truth.sdk.proj, 16);
     writeArrayF(out, "cam_pos", truth.sdk.cam_pos, 3);
     out << "  \"tan_fovx\": " << truth.sdk.tan_fovx << ",\n";
-    out << "  \"tan_fovy\": " << truth.sdk.tan_fovy << ",\n";
+    out << "  \"tan_fovy\": " << truth.sdk.tan_fovy << "\n";
     out << "}\n";
     return true;
 }

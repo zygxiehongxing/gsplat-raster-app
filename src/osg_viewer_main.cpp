@@ -141,8 +141,7 @@ void logProjNearFar(const char* tag, const osg::Matrixd& proj) {
 
 /// 使用当前帧 OSG view/proj 构建 SDK 相机参数。
 void buildCameraFromSnapshot(const osg::Matrixd& view, const osg::Matrixd& proj,
-                             const osg::Vec3d& scene_center, gsplat::Camera& out,
-                             gsplat::Rasterizer* raster_for_pick = nullptr) {
+                             const osg::Vec3d& scene_center, gsplat::Camera& out) {
     double fovy_deg = 0.0;
     double aspect = 1.0;
     double real_near = 0.01;
@@ -159,7 +158,7 @@ void buildCameraFromSnapshot(const osg::Matrixd& view, const osg::Matrixd& proj,
         double ref_center[3];
         sceneRefCenter(scene_center, ref_center);
         gsplat::buildCameraLookAt(eye_a, center_a, up_a, fovy_deg, aspect, real_near, real_far, ref_center, out,
-                                  raster_for_pick);
+                                  nullptr);
         return;
     }
 
@@ -275,33 +274,10 @@ osg::Vec3d computeSceneCenter(const std::vector<gsplat::Gaussian>& g) {
 
 
 
-/// 根据高斯数量限制预览渲染分辨率，平衡性能与清晰度。
-void previewRenderDims(int vp_w, int vp_h, int num_gaussians, int& out_w, int& out_h) {
-
+/// SDK 预览/截图分辨率：与 OSG 当前视口 1:1（不再按点数强制缩到 640）。
+void previewRenderDims(int vp_w, int vp_h, int /*num_gaussians*/, int& out_w, int& out_h) {
     out_w = std::max(1, vp_w);
-
     out_h = std::max(1, vp_h);
-
-    int max_w = 1280;
-
-    if (num_gaussians > 200000) {
-
-        max_w = 640;
-
-    } else if (num_gaussians > 80000) {
-
-        max_w = 960;
-
-    }
-
-    if (out_w > max_w) {
-
-        out_h = std::max(1, (out_h * max_w) / out_w);
-
-        out_w = max_w;
-
-    }
-
 }
 
 
@@ -438,7 +414,7 @@ void runTruthCapture(PreviewState* state, const osg::Matrixd& V, const osg::Matr
         std::cout << "[OSG APP] capture uses preview camera " << cap_w << "x" << cap_h << "\n";
     } else {
         updateScaleForSnapshot(V, state->scene_center, state->raster, state->scale_modifier);
-        buildCameraFromSnapshot(V, P, state->scene_center, gcam, state->raster);
+        buildCameraFromSnapshot(V, P, state->scene_center, gcam);
         previewRenderDims(vp_w, vp_h, state->raster->numGaussians(), cap_w, cap_h);
     }
 
@@ -487,7 +463,7 @@ void runTruthCapture(PreviewState* state, const osg::Matrixd& V, const osg::Matr
     }
 
     gsplat::Camera rebuilt;
-    buildCameraFromSnapshot(V, P, state->scene_center, rebuilt, state->raster);
+    buildCameraFromSnapshot(V, P, state->scene_center, rebuilt);
     double sdk_view[16], sdk_proj[16], reb_view[16], reb_proj[16];
     for (int i = 0; i < 16; ++i) {
         sdk_view[i] = static_cast<double>(gcam.view[i]);
@@ -785,7 +761,7 @@ public:
 
         gsplat::Camera gcam;
         updateScaleForSnapshot(V, state_->scene_center, state_->raster, state_->scale_modifier);
-        buildCameraFromSnapshot(V, P, state_->scene_center, gcam, state_->raster);
+        buildCameraFromSnapshot(V, P, state_->scene_center, gcam);
 
 
 
@@ -872,9 +848,9 @@ public:
 
             state_->logged_first_render = true;
 
-            std::cout << "[OSG APP] SDK preview " << rw << "x" << rh << ", visible ~" << visible << " / "
-
-                      << state_->raster->numGaussians() << "\n";
+            std::cout << "[OSG APP] SDK preview " << rw << "x" << rh << " (viewport " << vp_w << "x" << vp_h
+                      << ", 1:1), visible ~" << visible << " / " << state_->raster->numGaussians()
+                      << "\n";
 
         }
 
