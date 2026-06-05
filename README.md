@@ -67,9 +67,10 @@ REM 也支持反序: gsplat_osg_app 200000 scene.ply
 - `R`：真值对齐截图（同帧写出 `camera_truth_N.json`、`capture_N.png`、`truth_cli_N.png`）
 - `T`：只写 `camera_truth_N.json` + 进程内 `truth_cli_N.png` 复现（不写 `capture_*.png`）
 - `[` / `]` / `0`：调节 `scale_modifier`（默认约 `0.02`，比早期 `0.05` 更小以减少 CUDA 大块）
-- 环境变量 `GSPLAT_SCREEN_SCALE_MUL`（默认 `0.035`）：SSBO 解包时再缩小屏幕高斯尺度
-- 环境变量 `GSPLAT_SCREEN_MAX_OPACITY`（默认 `0.65`）：限制 SSBO 路径不透明度，减轻叠层糊块
-- 环境变量 `GSPLAT_DIAG_SSBO=1`：每 30 帧打印 SSBO cell 与 mean 重投影偏差（`[CACHE-SSBO-MAP]`）
+- 环境变量 `GSPLAT_SSBO_CAPACITY`（默认 `2000000`）：SSBO 视锥内 3D 高斯列表容量
+- 环境变量 `GSPLAT_SCREEN_SCALE_MUL`（默认 `1.0`）：SSBO 解包 scale 倍率（与全量 PLY 路径一致）
+- 环境变量 `GSPLAT_SCREEN_MAX_OPACITY`（默认 `1.0`）：SSBO 解包 opacity 上限
+- 环境变量 `GSPLAT_DIAG_SSBO=1`：每 30 帧打印 SSBO 列表统计（`[CACHE-SSBO-LIST]`）
 
 ### 真值对齐（ground truth）
 

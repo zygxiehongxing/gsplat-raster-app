@@ -189,6 +189,71 @@ void buildCameraFromSnapshot(const osg::Matrixd& view, const osg::Matrixd& proj,
                                static_cast<int>(probe_xyz.size() / 3));
 }
 
+/// 步骤 1：对比 SSBO 光栅相机 vs 同帧 OSG snapshot（前几次自动打印，或 GSPLAT_AUDIT_CAMERA=1）。
+void auditRenderCamera(const gsplat::Camera& render_cam, bool used_ssbo_meta, const osg::Matrixd& view,
+                       const osg::Matrixd& proj, const osg::Vec3d& scene_center,
+                       const std::vector<gsplat::Gaussian>* probe_cloud) {
+    static int audit_left = 3;
+    static int env_cached = -1;
+    if (env_cached < 0) {
+        const char* env = std::getenv("GSPLAT_AUDIT_CAMERA");
+        env_cached = (env && env[0] != '\0' && env[0] != '0') ? 1 : 0;
+    }
+    if (audit_left <= 0 && env_cached == 0) {
+        return;
+    }
+    if (audit_left > 0) {
+        --audit_left;
+    }
+
+    gsplat::Camera snap{};
+    buildCameraFromSnapshot(view, proj, scene_center, snap, nullptr, probe_cloud);
+
+    float max_view = 0.f;
+    float max_proj = 0.f;
+    int max_view_i = 0;
+    int max_proj_i = 0;
+    for (int i = 0; i < 16; ++i) {
+        const float dv = std::abs(render_cam.view[i] - snap.view[i]);
+        const float dp = std::abs(render_cam.proj[i] - snap.proj[i]);
+        if (dv > max_view) {
+            max_view = dv;
+            max_view_i = i;
+        }
+        if (dp > max_proj) {
+            max_proj = dp;
+            max_proj_i = i;
+        }
+    }
+    const float d_tan_x = std::abs(render_cam.tan_fovx - snap.tan_fovx);
+    const float d_tan_y = std::abs(render_cam.tan_fovy - snap.tan_fovy);
+    const float d_pos = std::max({std::abs(render_cam.cam_pos[0] - snap.cam_pos[0]),
+                                  std::abs(render_cam.cam_pos[1] - snap.cam_pos[1]),
+                                  std::abs(render_cam.cam_pos[2] - snap.cam_pos[2])});
+
+    std::cout << "[CAMERA-AUDIT] ssbo_meta=" << (used_ssbo_meta ? 1 : 0)
+              << " |render-snap_view| max=" << max_view << " at i=" << max_view_i
+              << " |render-snap_proj| max=" << max_proj << " at i=" << max_proj_i
+              << " |tan_fovx|=" << d_tan_x << " |tan_fovy|=" << d_tan_y << " |cam_pos|=" << d_pos
+              << " render_tan=(" << render_cam.tan_fovx << "," << render_cam.tan_fovy << ")"
+              << " snap_tan=(" << snap.tan_fovx << "," << snap.tan_fovy << ")\n";
+}
+
+/// 优先使用 SSBO 头里记录的 GL 矩阵（与视锥收集 pass 逐位一致），否则回退 OSG 快照。
+bool buildRenderCamera(app::GlScreenGaussianCache& cache, const osg::Matrixd& view, const osg::Matrixd& proj,
+                       const osg::Vec3d& scene_center, gsplat::Camera& out, int* mat_mode_out,
+                       const std::vector<gsplat::Gaussian>* probe_cloud) {
+    if (cache.hasSsboCamera()) {
+        out = cache.ssboCamera();
+        if (mat_mode_out) {
+            *mat_mode_out = 17;
+        }
+        return true;
+    }
+    buildCameraFromSnapshot(view, proj, scene_center, out, mat_mode_out, probe_cloud);
+    return false;
+}
+
 /// GL/SSBO/SDK：主相机 view/proj。
 bool getDrawMatrices(osg::RenderInfo& renderInfo, osg::Camera* cam, osg::Matrixd& V, osg::Matrixd& P,
                      int& vp_w, int& vp_h) {
@@ -222,6 +287,35 @@ struct PreviewState;
 void runTruthCapture(PreviewState* state, osg::State* gl_state, const osg::Matrixd& V, const osg::Matrixd& P,
                      int vp_w, int vp_h, bool do_png, const gsplat::Camera* frozen_cam = nullptr,
                      int frozen_w = 0, int frozen_h = 0, bool reuse_screen_buffers = false);
+
+/// 截图/真值渲染：scale 过大时自动减半重试，避免 binning OOM 导致无 PNG。
+gsplat::Status renderToPngWithScaleFallback(gsplat::Rasterizer* raster, const gsplat::Camera& cam, int w,
+                                            int h, const gsplat::DeviceGaussianBuffers& buf,
+                                            const std::string& path, float start_scale, float& out_used_scale) {
+    if (!raster) return gsplat::Status::ErrorRenderFailed;
+    float try_scale = std::clamp(start_scale, 0.005f, 2.0f);
+    for (int attempt = 0; attempt < 6; ++attempt) {
+        gsplat::RenderSettings rs = raster->settings();
+        rs.scale_modifier = try_scale;
+        raster->setSettings(rs);
+        const gsplat::Status st = raster->renderToPng(cam, w, h, buf, path);
+        if (st == gsplat::Status::Ok) {
+            out_used_scale = try_scale;
+            if (attempt > 0) {
+                std::cout << "[OSG APP] capture ok at scale_modifier=" << try_scale << " (reduced from "
+                          << start_scale << ")\n";
+            }
+            return st;
+        }
+        if (try_scale <= 0.03f + 1e-5f) {
+            break;
+        }
+        try_scale = std::max(0.03f, try_scale * 0.5f);
+        std::cout << "[OSG APP] capture retry scale_modifier=" << try_scale << "\n";
+    }
+    out_used_scale = try_scale;
+    return gsplat::Status::ErrorRenderFailed;
+}
 
 /// 将交互调节后的 scale_modifier 应用到 raster 设置。
 void updateScaleForSnapshot(const osg::Matrixd& view, const osg::Vec3d& scene_center,
@@ -277,7 +371,7 @@ void previewRenderDims(int vp_w, int vp_h, int /*num_gaussians*/, int& out_w, in
     out_h = std::max(1, vp_h);
 }
 
-/// PostDraw：SSBO 已在主相机绘制时写好，此处仅 unpack 到 CUDA。
+/// PostDraw：SSBO 已在主相机绘制时写好；CUDA-GL interop map 后在 GPU 上 unpack（无 CPU 回读）。
 gsplat::Status unpackGlScreenCache(app::GlScreenGaussianCache& cache) {
     if (cache.sourceCount() <= 0) return gsplat::Status::ErrorNoGaussians;
     if (!gsplat::isCudaAvailable()) return gsplat::Status::ErrorNoCuda;
@@ -335,7 +429,7 @@ struct PreviewState {
     int capture_idx = 0;
     bool pending_capture = false;
     bool pending_truth_dump = false;
-    float scale_modifier = 0.02f;
+    float scale_modifier = 0.03f;
 
     gsplat::Camera last_gcam;
     bool have_last_gcam = false;
@@ -431,7 +525,8 @@ void runTruthCapture(PreviewState* state, osg::State* gl_state, const osg::Matri
         std::cout << "[OSG APP] capture uses preview camera " << cap_w << "x" << cap_h << "\n";
     } else {
         updateScaleForSnapshot(V, state->scene_center, state->raster, state->scale_modifier);
-        buildCameraFromSnapshot(V, P_use, state->scene_center, gcam, &snap_mat_mode, state->source_cloud);
+        buildRenderCamera(state->gl_screen_cache, V, P_use, state->scene_center, gcam, &snap_mat_mode,
+                          state->source_cloud);
         previewRenderDims(vp_w, vp_h, state->gl_screen_cache.sourceCount(), cap_w, cap_h);
         std::memcpy(view_gl, view_a, sizeof(view_gl));
         std::memcpy(proj_gl, proj_a, sizeof(proj_gl));
@@ -444,47 +539,34 @@ void runTruthCapture(PreviewState* state, osg::State* gl_state, const osg::Matri
 
     int visible = 0;
     const bool can_reuse = reuse_screen_buffers && state->gl_screen_cache.ssboReady() &&
-                           state->gl_screen_cache.filledCount() > 0 &&
-                           state->gl_screen_cache.width() == cap_w && state->gl_screen_cache.height() == cap_h;
-    if (can_reuse && state->have_last_ssbo_gcam) {
-        // Reused SSBO must be rendered with the camera that produced that SSBO frame.
-        gcam = state->last_ssbo_gcam;
+                           state->gl_screen_cache.filledCount() > 0;
+    gsplat::Status prep_st = gsplat::Status::Ok;
+    if (!can_reuse || state->gl_screen_cache.deviceBuffers().count <= 0) {
+        prep_st = unpackGlScreenCache(state->gl_screen_cache);
     }
-    const gsplat::Status prep_st = unpackGlScreenCache(state->gl_screen_cache);
-    if (prep_st == gsplat::Status::Ok && state->gl_screen_cache.hasSsboCamera()) {
-        gcam = state->gl_screen_cache.ssboCamera();
-    } else if (can_reuse && state->have_last_ssbo_gcam) {
-        gcam = state->last_ssbo_gcam;
+    if (prep_st != gsplat::Status::Ok) {
+        std::cout << "[OSG APP] capture unpack failed: " << gsplat::statusString(prep_st) << "\n";
     }
     if (can_reuse) {
-        std::cout << "[OSG APP] capture reuses screen SSBO from main draw (" << cap_w << "x" << cap_h
+        std::cout << "[OSG APP] capture reuses screen SSBO (" << cap_w << "x" << cap_h
                   << ") filled=" << state->gl_screen_cache.filledCount() << "\n";
     }
     const gsplat::DeviceGaussianBuffers& screen_buf = state->gl_screen_cache.deviceBuffers();
+    float capture_scale = state->scale_modifier;
     if (do_png) {
-        const size_t rgb_bytes = static_cast<size_t>(cap_w) * static_cast<size_t>(cap_h) * 3u;
-        const int hud_min_visible = std::max(500, screen_buf.count / 20);
-        // Strict same-frame policy: never reuse previous RGB output for capture.
-        const bool snap_hud = false;
-        gsplat::Status cap_st = gsplat::Status::ErrorRenderFailed;
-        if (snap_hud && gsplat::writeRgbPng(capture_path, cap_w, cap_h, state->last_rgb)) {
-            cap_st = gsplat::Status::Ok;
-            visible = state->last_raster_visible;
+        const gsplat::Status cap_st =
+            (prep_st == gsplat::Status::Ok)
+                ? renderToPngWithScaleFallback(state->raster, gcam, cap_w, cap_h, screen_buf, capture_path,
+                                               state->scale_modifier, capture_scale)
+                : prep_st;
+        visible = (cap_st == gsplat::Status::Ok) ? state->raster->lastVisibleCount() : 0;
+        if (cap_st == gsplat::Status::Ok) {
             std::cout << "[OSG APP] wrote " << capture_path << " (" << cap_w << "x" << cap_h
                       << ") splats=" << screen_buf.count << " raster_visible=" << visible
-                      << " (HUD preview rgb)\n";
+                      << " scale=" << capture_scale << (can_reuse ? " (ssbo gpu)" : "") << "\n";
         } else {
-            cap_st = (prep_st == gsplat::Status::Ok)
-                         ? state->raster->renderToPng(gcam, cap_w, cap_h, screen_buf, capture_path)
-                         : prep_st;
-            visible = (cap_st == gsplat::Status::Ok) ? state->raster->lastVisibleCount() : 0;
-            if (cap_st == gsplat::Status::Ok) {
-                std::cout << "[OSG APP] wrote " << capture_path << " (" << cap_w << "x" << cap_h
-                          << ") splats=" << screen_buf.count << " raster_visible=" << visible
-                          << (can_reuse ? " (reused screen buf)" : "") << "\n";
-            } else {
-                std::cout << "[OSG APP] capture failed: " << gsplat::statusString(cap_st) << "\n";
-            }
+            std::cout << "[OSG APP] capture failed: " << gsplat::statusString(cap_st)
+                      << " (try 0 to reset scale, then R)\n";
         }
     } else {
         std::vector<uint8_t> rgb;
@@ -503,7 +585,7 @@ void runTruthCapture(PreviewState* state, osg::State* gl_state, const osg::Matri
     truth.height = cap_h;
     truth.mat_mode = snap_mat_mode;
     truth.proj_mul_pv = false;
-    truth.scale_modifier = state->scale_modifier;
+    truth.scale_modifier = capture_scale;
     truth.dc_only = state->raster->settings().dc_only;
     truth.drop_sh_rest = true;
     truth.min_opacity = 0.002f;
@@ -534,10 +616,12 @@ void runTruthCapture(PreviewState* state, osg::State* gl_state, const osg::Matri
     if (loadCameraTruth(truth_path, loaded)) {
         applyTruthRenderSettings(*state->raster, loaded);
         const gsplat::Status cli_prep = unpackGlScreenCache(state->gl_screen_cache);
+        float cli_scale = loaded.scale_modifier;
         const gsplat::Status cli_st =
             (cli_prep == gsplat::Status::Ok)
-                ? state->raster->renderToPng(loaded.sdk, cap_w, cap_h, state->gl_screen_cache.deviceBuffers(),
-                                             cli_path)
+                ? renderToPngWithScaleFallback(state->raster, loaded.sdk, cap_w, cap_h,
+                                               state->gl_screen_cache.deviceBuffers(), cli_path,
+                                               loaded.scale_modifier, cli_scale)
                 : cli_prep;
         if (cli_st == gsplat::Status::Ok) {
             std::cout << "[OSG APP] truth_cli replay -> " << cli_path << " visible="
@@ -706,6 +790,10 @@ public:
 
             if (ea.getKey() == 'r' || ea.getKey() == 'R') {
                 (void)aa;
+                if (state_->scale_modifier > 1.0f) {
+                    std::cout << "[OSG APP] warn: scale_modifier=" << state_->scale_modifier
+                              << " may OOM; press 0 to reset before capture\n";
+                }
                 state_->pending_capture = true;
                 state_->force_render = true;
                 std::cout << "[OSG APP] truth capture queued (next rendered frame)\n";
@@ -719,21 +807,29 @@ public:
                 return true;
             }
 
-            if (ea.getKey() == '[') {
-                state_->scale_modifier = std::max(0.005f, state_->scale_modifier * 0.8f);
+            if (ea.getKey() == '[' || ea.getKey() == '-') {
+                state_->scale_modifier = std::max(0.005f, state_->scale_modifier / 1.5f);
                 state_->force_render = true;
-                std::cout << "[OSG APP] scale_modifier=" << state_->scale_modifier << "\n";
+                updateScaleForSnapshot(osg::Matrixd(), state_->scene_center, state_->raster,
+                                       state_->scale_modifier);
+                std::cout << "[OSG APP] scale_modifier=" << state_->scale_modifier
+                          << " applied=" << state_->raster->settings().scale_modifier << "\n";
                 return true;
             }
-            if (ea.getKey() == ']') {
-                state_->scale_modifier = std::min(2.0f, state_->scale_modifier * 1.25f);
+            if (ea.getKey() == ']' || ea.getKey() == '}' || ea.getKey() == '=' || ea.getKey() == '+') {
+                state_->scale_modifier = std::min(2.0f, state_->scale_modifier * 1.5f);
                 state_->force_render = true;
-                std::cout << "[OSG APP] scale_modifier=" << state_->scale_modifier << "\n";
+                updateScaleForSnapshot(osg::Matrixd(), state_->scene_center, state_->raster,
+                                       state_->scale_modifier);
+                std::cout << "[OSG APP] scale_modifier=" << state_->scale_modifier
+                          << " applied=" << state_->raster->settings().scale_modifier << "\n";
                 return true;
             }
             if (ea.getKey() == '0') {
-                state_->scale_modifier = 0.015f;
+                state_->scale_modifier = 0.03f;
                 state_->force_render = true;
+                updateScaleForSnapshot(osg::Matrixd(), state_->scene_center, state_->raster,
+                                       state_->scale_modifier);
                 std::cout << "[OSG APP] scale_modifier reset=" << state_->scale_modifier << "\n";
                 return true;
             }
@@ -845,13 +941,7 @@ public:
 
         int rw = vp_w;
         int rh = vp_h;
-        if (state_->gl_screen_cache.ssboReady() && state_->gl_screen_cache.width() > 0 &&
-            state_->gl_screen_cache.height() > 0) {
-            rw = state_->gl_screen_cache.width();
-            rh = state_->gl_screen_cache.height();
-        } else {
-            previewRenderDims(vp_w, vp_h, state_->gl_screen_cache.sourceCount(), rw, rh);
-        }
+        previewRenderDims(vp_w, vp_h, state_->gl_screen_cache.sourceCount(), rw, rh);
 
         gsplat::Camera gcam{};
         osg::State* gl_state = renderInfo.getState();
@@ -859,14 +949,10 @@ public:
         std::vector<uint8_t> rgb;
         const gsplat::Status prep_st =
             gl_state ? unpackGlScreenCache(state_->gl_screen_cache) : gsplat::Status::ErrorRenderFailed;
-        if (prep_st == gsplat::Status::Ok && state_->gl_screen_cache.hasSsboCamera()) {
-            gcam = state_->gl_screen_cache.ssboCamera();
-            state_->last_ssbo_gcam = gcam;
-            state_->have_last_ssbo_gcam = true;
-        } else {
-            updateScaleForSnapshot(V, state_->scene_center, state_->raster, state_->scale_modifier);
-            buildCameraFromSnapshot(V, P, state_->scene_center, gcam, &state_->last_mat_mode, state_->source_cloud);
-        }
+        updateScaleForSnapshot(V, state_->scene_center, state_->raster, state_->scale_modifier);
+        const bool used_ssbo_cam = buildRenderCamera(state_->gl_screen_cache, V, P, state_->scene_center, gcam,
+                                                   &state_->last_mat_mode, state_->source_cloud);
+        auditRenderCamera(gcam, used_ssbo_cam, V, P, state_->scene_center, state_->source_cloud);
         const gsplat::DeviceGaussianBuffers& screen_buf = state_->gl_screen_cache.deviceBuffers();
         const gsplat::Status st =
             (prep_st == gsplat::Status::Ok) ? state_->raster->render(gcam, rw, rh, screen_buf, rgb) : prep_st;
@@ -952,10 +1038,9 @@ public:
             state_->logged_first_render = true;
 
             std::cout << "[OSG APP] SDK Inria raster " << rw << "x" << rh << " visible=" << raster_visible
-                      << " ssbo_filled=" << ssbo_filled << " (viewport " << vp_w << "x" << vp_h
-                      << ", 1:1), raster_visible=" << raster_visible << " ssbo_filled=" << ssbo_filled
-                      << " / " << state_->gl_screen_cache.sourceCount() << " mat_mode=" << state_->last_mat_mode
-                      << "\n";
+                      << " ssbo_gpu=" << screen_buf.count << " filled=" << ssbo_filled << " / "
+                      << state_->gl_screen_cache.sourceCount() << " mat_mode=" << state_->last_mat_mode
+                      << " (viewport " << vp_w << "x" << vp_h << ")\n";
 
         }
 
@@ -1129,7 +1214,7 @@ int main(int argc, char** argv) {
     gsplat::RenderSettings rs;
 
     rs.dc_only = false;
-    rs.scale_modifier = 0.02f;
+    rs.scale_modifier = 0.03f;
 
     raster.setSettings(rs);
 
@@ -1195,7 +1280,7 @@ int main(int argc, char** argv) {
     viewer.addSlave(createHudCamera(preview.texture.get()), false);
     viewer.getCamera()->setPostDrawCallback(new SdkPostDrawCallback(&preview));
 
-    std::cout << "[OSG APP] roam: P=preview, R=capture, T=truth json, [ ] scale, 0=reset scale.\n";
+    std::cout << "[OSG APP] roam: P=preview, R=capture, T=truth json, [ - / ] = + scale, 0=reset.\n";
     std::cout << "[OSG APP] CJK IME is disabled on the 3D window to prevent UI freeze.\n";
 
     return viewer.run();

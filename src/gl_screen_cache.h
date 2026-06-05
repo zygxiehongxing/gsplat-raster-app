@@ -1,7 +1,7 @@
 #pragma once
 
 /**
- * GL point pass + depth test writes W×H Gaussian SSBO; CUDA interop unpacks to SDK SoA.
+ * GL 视锥收集 + SSBO 列表（默认 200 万槽）→ CUDA interop unpack → SDK EWA 光栅。
  */
 
 #include <gsplat_raster/gsplat_raster.h>
@@ -26,12 +26,13 @@ public:
 
     bool uploadSource(const std::vector<gsplat::Gaussian>& gaussians, bool dc_only = true);
     int sourceCount() const { return source_count_; }
+    int ssboCapacity() const { return ssbo_capacity_; }
 
-    /// Main camera draw: points on screen + per-pixel SSBO.
+    /// 主相机绘制：视锥内点原子追加到 SSBO 列表。
     gsplat::Status drawPointsAndSsbo(osg::State* state, const osg::Matrixd& view, const osg::Matrixd& proj,
                                    int width, int height);
 
-    /// PostDraw: map SSBO and unpack to CUDA SoA.
+    /// PostDraw：map SSBO 列表并 unpack 到 CUDA SoA。
     gsplat::Status unpackSsboToDevice();
 
     bool ssboReady() const { return ssbo_ready_; }
@@ -46,12 +47,13 @@ public:
 
 private:
     bool ensureSourceVbo(osg::GLExtensions* ext);
-    bool ensureScreenResources(osg::GLExtensions* ext, int width, int height);
+    bool ensureScreenResources(osg::GLExtensions* ext);
     bool ensureCudaInterop();
     bool compileProgram(osg::GLExtensions* ext);
     void bindSourceAttribs(osg::GLExtensions* ext);
     void destroyGl();
     void destroyCudaInterop();
+    int resolveSsboCapacity() const;
 
     std::vector<gsplat::Gaussian> pending_source_;
     bool dc_only_ = true;
@@ -63,6 +65,7 @@ private:
     unsigned int vao_ = 0;
     unsigned int program_shader_gen_ = 0;
     int source_count_ = 0;
+    int ssbo_capacity_ = static_cast<int>(gsplat::kDefaultScreenSsboCapacity);
     int width_ = 0;
     int height_ = 0;
     int filled_count_ = 0;
