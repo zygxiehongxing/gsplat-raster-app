@@ -1,3 +1,4 @@
+#include <gsplat_raster/gaussian_device.h>
 #include <gsplat_raster/gsplat_raster.h>
 
 #include "camera_truth.h"
@@ -237,7 +238,9 @@ int main(int argc, char** argv) {
         printCameraTruthSummary(truth, truth_json_path.c_str());
     }
     raster.setSettings(settings);
-    if (raster.setGaussians(std::move(gaussians)) != gsplat::Status::Ok) {
+    gsplat::GaussianDevicePool pool;
+    pool.setDcOnly(settings.dc_only);
+    if (pool.upload(std::move(gaussians)) != gsplat::Status::Ok) {
         std::cerr << "Upload failed\n";
         return 4;
     }
@@ -254,15 +257,15 @@ int main(int argc, char** argv) {
         }
         std::cout << "Using camera from: " << camera_json_path << "\n";
     } else {
-        gsplat::buildCameraLookAt(eye, center, up, 60.0, aspect, 0.01, 10000.0, center, cam, &raster);
+        gsplat::buildCameraLookAt(eye, center, up, 60.0, aspect, 0.01, 10000.0, center, cam);
     }
 
-    const int frustum = raster.countFrustumPass(cam);
+    const int frustum = pool.countFrustumPass(cam);
     std::cout << "Frustum pass (sampled): ~" << frustum << "\n";
 
     int render_w = width;
     int render_h = height;
-    const int n = raster.numGaussians();
+    const int n = pool.numSplats();
     if (n > 100000) {
         const int cap_w = 960;
         if (render_w > cap_w) {
@@ -273,15 +276,27 @@ int main(int argc, char** argv) {
         }
     }
 
-    std::cout << "Rendering " << render_w << "x" << render_h << " -> " << png << " ...\n" << std::flush;
-    const gsplat::Status st = raster.renderToPng(cam, render_w, render_h, png);
+    gsplat::DeviceGaussianBuffers subset;
+    const gsplat::Status filt_st = pool.filterVisible(cam, subset);
+    if (filt_st != gsplat::Status::Ok) {
+        std::cerr << "Filter failed: " << gsplat::statusString(filt_st) << "\n";
+        gsplat::resetCudaDevice();
+        return 5;
+    }
+
+    std::cout << "Rendering " << render_w << "x" << render_h << " (" << subset.count << " splats) -> " << png
+              << " ...\n"
+              << std::flush;
+    const int subset_count = subset.count;
+    const gsplat::Status st = raster.renderToPng(cam, render_w, render_h, subset, png);
+    gsplat::freeDeviceGaussianBuffers(subset);
     if (st != gsplat::Status::Ok) {
         std::cerr << "Render failed: " << gsplat::statusString(st) << "\n";
         gsplat::resetCudaDevice();
         return 5;
     }
     const int vis = raster.lastVisibleCount();
-    std::cout << "Visible splats: " << vis << " / " << raster.numGaussians() << "\n";
+    std::cout << "Visible splats (radii): " << vis << " / subset " << subset_count << " / total " << n << "\n";
     if (!truth_json_path.empty() && truth.visible > 0) {
         const int delta = vis - truth.visible;
         std::cout << "Truth visible delta (cli - recorded): " << delta << "\n";

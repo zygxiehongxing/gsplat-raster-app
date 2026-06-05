@@ -1,6 +1,7 @@
 #include <gsplat_raster/gsplat_raster.h>
 
 #include "camera_truth.h"
+#include "gl_screen_cache.h"
 #include "ply_loader_local.h"
 
 #include <osg/BlendFunc>
@@ -9,13 +10,23 @@
 
 #include <osg/Camera>
 
+#include <osg/DisplaySettings>
+
+#include <osg/Drawable>
+
 #include <osg/Geode>
 
 #include <osg/Geometry>
 
+#include <osg/Group>
+
 #include <osg/Image>
 
+#include <osg/PrimitiveSet>
+
 #include <osg/Point>
+
+#include <osg/State>
 
 #include <osg/Texture2D>
 
@@ -26,6 +37,11 @@
 #include <osgGA/TrackballManipulator>
 
 #include <osgViewer/Viewer>
+
+
+#ifdef GSPLAT_CUDA_ENABLED
+#include <cuda_runtime.h>
+#endif
 
 
 
@@ -45,7 +61,32 @@
 
 #include <vector>
 
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <osgViewer/api/Win32/GraphicsWindowWin32>
+#include <imm.h>
 
+/// 3D 视图无文本输入：解除 Win32 IME 关联，避免中文输入法嵌套消息循环导致 OSG 卡死。
+void disableWindowsImeOnViewer(osgViewer::Viewer& viewer) {
+    osgViewer::GraphicsWindow* gw =
+        dynamic_cast<osgViewer::GraphicsWindow*>(viewer.getCamera()->getGraphicsContext());
+    auto* gw32 = dynamic_cast<osgViewer::GraphicsWindowWin32*>(gw);
+    if (!gw32) {
+        return;
+    }
+    const HWND hwnd = gw32->getHWND();
+    if (!hwnd) {
+        return;
+    }
+    ImmAssociateContext(hwnd, nullptr);
+    std::cout << "[OSG APP] Win32 IME disabled on GL window (avoids CJK IME freeze)\n";
+}
+#endif
 
 namespace {
 
@@ -85,13 +126,6 @@ void osgMatrixToArray(const osg::Matrixd& m, double out[16]) {
 
 }
 
-/// 4x4 行主序矩阵转置。
-void transposeMat4(const double in[16], double out[16]) {
-    for (int r = 0; r < 4; ++r) {
-        for (int c = 0; c < 4; ++c) out[r * 4 + c] = in[c * 4 + r];
-    }
-}
-
 /// 比较两组 4x4 行主序矩阵是否完全相等。
 bool matricesEqual(const double a[16], const double b[16]) {
 
@@ -123,108 +157,71 @@ bool extractLookAtFromView(const osg::Matrixd& view, osg::Vec3d& eye, osg::Vec3d
     return true;
 }
 
-/// 打印投影参数（透视 near/far 或正交 near/far），用于对齐排查。
-void logProjNearFar(const char* tag, const osg::Matrixd& proj) {
-    double fovy = 0.0, aspect = 1.0, znear = 0.01, zfar = 10000.0;
-    if (proj.getPerspective(fovy, aspect, znear, zfar)) {
-        std::cout << "[TRUTH] " << tag << " perspective near/far=" << znear << "/" << zfar
-                  << " fovy=" << fovy << " aspect=" << aspect << "\n";
-        return;
+/// 从 PLY 子集采样世界坐标，供 OSG→CUDA 矩阵模式探测。
+void fillCameraProbes(const std::vector<gsplat::Gaussian>* cloud, std::vector<float>& out_xyz) {
+    out_xyz.clear();
+    if (!cloud || cloud->empty()) return;
+    const int n = static_cast<int>(cloud->size());
+    const int step = std::max(1, n / 2048);
+    out_xyz.reserve(static_cast<size_t>((n + step - 1) / step) * 3u);
+    for (int i = 0; i < n; i += step) {
+        const auto& g = cloud->at(static_cast<size_t>(i));
+        out_xyz.push_back(g.x);
+        out_xyz.push_back(g.y);
+        out_xyz.push_back(g.z);
     }
-    double l = 0.0, r = 0.0, b = 0.0, t = 0.0, n = 0.0, f = 0.0;
-    if (proj.getOrtho(l, r, b, t, n, f)) {
-        std::cout << "[TRUTH] " << tag << " ortho near/far=" << n << "/" << f << "\n";
-        return;
-    }
-    std::cout << "[TRUTH] " << tag << " projection decode failed\n";
 }
 
-/// 使用当前帧 OSG view/proj 构建 SDK 相机参数。
+/// 使用当前帧 OSG view/proj 构建 SDK 相机（与 GL SSBO pass 同一套矩阵）。
 void buildCameraFromSnapshot(const osg::Matrixd& view, const osg::Matrixd& proj,
-                             const osg::Vec3d& scene_center, gsplat::Camera& out) {
-    double fovy_deg = 0.0;
-    double aspect = 1.0;
-    double real_near = 0.01;
-    double real_far = 10000.0;
-    osg::Vec3d eye, center, up;
-    if (proj.getPerspective(fovy_deg, aspect, real_near, real_far) &&
-        std::isfinite(fovy_deg) && fovy_deg > 0.01 && std::isfinite(aspect) && aspect > 1e-6 &&
-        std::isfinite(real_near) && std::isfinite(real_far) && real_near > 1e-6 && real_far > real_near) {
-        // 使用 OSG 官方分解，避免手写矩阵约定误差导致的拉伸/翻转。
-        view.getLookAt(eye, center, up);
-        const double eye_a[3] = {eye.x(), eye.y(), eye.z()};
-        const double center_a[3] = {center.x(), center.y(), center.z()};
-        const double up_a[3] = {up.x(), up.y(), up.z()};
-        double ref_center[3];
-        sceneRefCenter(scene_center, ref_center);
-        gsplat::buildCameraLookAt(eye_a, center_a, up_a, fovy_deg, aspect, real_near, real_far, ref_center, out,
-                                  nullptr);
-        return;
-    }
-
+                             const osg::Vec3d& scene_center, gsplat::Camera& out, int* mat_mode_out = nullptr,
+                             const std::vector<gsplat::Gaussian>* probe_cloud = nullptr) {
     double view_a[16];
     double proj_a[16];
     osgMatrixToArray(view, view_a);
     osgMatrixToArray(proj, proj_a);
     double ref_center[3];
     sceneRefCenter(scene_center, ref_center);
-    // 回退：若非透视投影，仍走矩阵转换路径。
-    gsplat::buildCameraFromOsg(view_a, proj_a, ref_center, out);
+    static thread_local std::vector<float> probe_xyz;
+    fillCameraProbes(probe_cloud, probe_xyz);
+    gsplat::buildCameraFromOsg(view_a, proj_a, ref_center, out, mat_mode_out,
+                               probe_xyz.empty() ? nullptr : probe_xyz.data(),
+                               static_cast<int>(probe_xyz.size() / 3));
 }
 
-/// 获取当前绘制帧的相机矩阵与视口尺寸。
+/// GL/SSBO/SDK：主相机 view/proj。
 bool getDrawMatrices(osg::RenderInfo& renderInfo, osg::Camera* cam, osg::Matrixd& V, osg::Matrixd& P,
-                     int& vp_w, int& vp_h, const char*& source_tag) {
+                     int& vp_w, int& vp_h) {
     vp_w = 1280;
     vp_h = 720;
-    source_tag = "none";
-    // view 必须来自 camera，避免 State::ModelView 混入模型变换导致姿态错误。
-    if (cam) {
-        V = cam->getViewMatrix();
-        source_tag = "camera";
-        // projection 优先用 State（可拿到动态 near/far），否则回退 camera projection。
-        osg::State* osg_state = renderInfo.getState();
-        if (osg_state) {
-            P = osg_state->getProjectionMatrix();
-            source_tag = "camera_view+state_proj";
-            const osg::Viewport* vp = osg_state->getCurrentViewport();
-            if (vp && vp->width() > 0 && vp->height() > 0) {
-                vp_w = std::max(1, static_cast<int>(vp->width()));
-                vp_h = std::max(1, static_cast<int>(vp->height()));
-                return true;
-            }
-        } else {
-            P = cam->getProjectionMatrix();
-        }
-        const osg::Viewport* vp = cam->getViewport();
-        if (vp && vp->width() > 0 && vp->height() > 0) {
-            vp_w = std::max(1, static_cast<int>(vp->width()));
-            vp_h = std::max(1, static_cast<int>(vp->height()));
-        }
-        return true;
-    }
-    // 无 camera 时才回退 State 矩阵。
+    if (!cam) return false;
+
+    V = cam->getViewMatrix();
+    P = cam->getProjectionMatrix();
+
     osg::State* osg_state = renderInfo.getState();
     if (osg_state) {
-        V = osg_state->getModelViewMatrix();
-        P = osg_state->getProjectionMatrix();
-        source_tag = "state_fallback";
         const osg::Viewport* vp = osg_state->getCurrentViewport();
         if (vp && vp->width() > 0 && vp->height() > 0) {
             vp_w = std::max(1, static_cast<int>(vp->width()));
             vp_h = std::max(1, static_cast<int>(vp->height()));
+            return true;
         }
-        return true;
     }
-    return false;
+    const osg::Viewport* vp = cam->getViewport();
+    if (vp && vp->width() > 0 && vp->height() > 0) {
+        vp_w = std::max(1, static_cast<int>(vp->width()));
+        vp_h = std::max(1, static_cast<int>(vp->height()));
+    }
+    return true;
 }
 
 struct PreviewState;
 
 /// 执行一次真值导出/截图流程（truth json + capture + replay）。
-void runTruthCapture(PreviewState* state, const osg::Matrixd& V, const osg::Matrixd& P, int vp_w, int vp_h,
-                     bool do_png, const gsplat::Camera* frozen_cam = nullptr, int frozen_w = 0,
-                     int frozen_h = 0);
+void runTruthCapture(PreviewState* state, osg::State* gl_state, const osg::Matrixd& V, const osg::Matrixd& P,
+                     int vp_w, int vp_h, bool do_png, const gsplat::Camera* frozen_cam = nullptr,
+                     int frozen_w = 0, int frozen_h = 0, bool reuse_screen_buffers = false);
 
 /// 将交互调节后的 scale_modifier 应用到 raster 设置。
 void updateScaleForSnapshot(const osg::Matrixd& view, const osg::Vec3d& scene_center,
@@ -233,7 +230,7 @@ void updateScaleForSnapshot(const osg::Matrixd& view, const osg::Vec3d& scene_ce
     (void)scene_center;
     if (!raster) return;
     gsplat::RenderSettings rs = raster->settings();
-    rs.scale_modifier = std::clamp(scale_modifier, 0.005f, 0.5f);
+    rs.scale_modifier = std::clamp(scale_modifier, 0.005f, 2.0f);
     raster->setSettings(rs);
 }
 
@@ -280,75 +277,24 @@ void previewRenderDims(int vp_w, int vp_h, int /*num_gaussians*/, int& out_w, in
     out_h = std::max(1, vp_h);
 }
 
-
-
-/// 构建 OSG 点预览节点（GPU splat 之外的参考视图）。
-osg::ref_ptr<osg::Node> buildPointNode(const std::vector<gsplat::Gaussian>& g) {
-
-    auto geode = osg::ref_ptr<osg::Geode>(new osg::Geode());
-
-    auto geom = osg::ref_ptr<osg::Geometry>(new osg::Geometry());
-
-
-
-    auto verts = osg::ref_ptr<osg::Vec3Array>(new osg::Vec3Array());
-
-    auto colors = osg::ref_ptr<osg::Vec4Array>(new osg::Vec4Array());
-
-    verts->reserve(g.size());
-
-    colors->reserve(g.size());
-
-
-
-    for (const auto& p : g) {
-
-        verts->push_back(osg::Vec3(p.x, p.y, p.z));
-
-        const float r = clamp01(0.5f + kShC0 * p.sh[0]);
-
-        const float gg = clamp01(0.5f + kShC0 * p.sh[1]);
-
-        const float b = clamp01(0.5f + kShC0 * p.sh[2]);
-
-        colors->push_back(osg::Vec4(r, gg, b, 1.f));
-
-    }
-
-
-
-    geom->setVertexArray(verts.get());
-
-    geom->setColorArray(colors.get(), osg::Array::BIND_PER_VERTEX);
-
-    geom->addPrimitiveSet(new osg::DrawArrays(GL_POINTS, 0, static_cast<GLsizei>(verts->size())));
-
-    geode->addDrawable(geom.get());
-
-
-
-    auto point_state = geode->getOrCreateStateSet();
-
-    auto point = osg::ref_ptr<osg::Point>(new osg::Point());
-
-    point->setSize(2.0f);
-
-    point_state->setAttribute(point.get());
-
-    point_state->setMode(GL_LIGHTING, osg::StateAttribute::OFF);
-
-    return geode;
-
+/// PostDraw：SSBO 已在主相机绘制时写好，此处仅 unpack 到 CUDA。
+gsplat::Status unpackGlScreenCache(app::GlScreenGaussianCache& cache) {
+    if (cache.sourceCount() <= 0) return gsplat::Status::ErrorNoGaussians;
+    if (!gsplat::isCudaAvailable()) return gsplat::Status::ErrorNoCuda;
+    return cache.unpackSsboToDevice();
 }
-
-
 
 /// 预览运行时状态（纹理、相机、交互标志、缓存帧）。
 struct PreviewState {
 
     gsplat::Rasterizer* raster = nullptr;
 
+    const std::vector<gsplat::Gaussian>* source_cloud = nullptr;
+
+    app::GlScreenGaussianCache gl_screen_cache;
+
     osg::Vec3d scene_center;
+    double scene_radius = 10.0;
 
     osg::ref_ptr<osg::Texture2D> texture;
 
@@ -383,39 +329,112 @@ struct PreviewState {
     int warmup_frames = 0;
 
     bool logged_first_render = false;
+    bool logged_prep_fail = false;
     int zero_visible_streak = 0;
 
     int capture_idx = 0;
     bool pending_capture = false;
     bool pending_truth_dump = false;
-    float scale_modifier = 0.03f;
+    float scale_modifier = 0.02f;
 
     gsplat::Camera last_gcam;
     bool have_last_gcam = false;
-
+    gsplat::Camera last_ssbo_gcam;
+    bool have_last_ssbo_gcam = false;
+    int last_raster_visible = 0;
+    int last_mat_mode = -1;
 };
 
+/// 一次 glDrawArrays：顶点着色器投影 + 片元写 SSBO 并输出颜色（无第二遍点云）。
+class ScreenSsboDrawDrawable : public osg::Drawable {
+public:
+    ScreenSsboDrawDrawable() {
+        setSupportsDisplayList(false);
+        setUseVertexBufferObjects(false);
+    }
+
+    void setCache(app::GlScreenGaussianCache* cache) { cache_ = cache; }
+
+    void drawImplementation(osg::RenderInfo& renderInfo) const override {
+        if (!cache_ || cache_->sourceCount() <= 0) return;
+        osg::State* st = renderInfo.getState();
+        if (!st) return;
+        osg::Matrixd V;
+        osg::Matrixd P;
+        int w = 1280;
+        int h = 720;
+        if (!getDrawMatrices(renderInfo, renderInfo.getCurrentCamera(), V, P, w, h)) {
+            return;
+        }
+        cache_->drawPointsAndSsbo(st, V, P, w, h);
+    }
+
+    osg::Object* cloneType() const override { return new ScreenSsboDrawDrawable(); }
+    osg::Object* clone(const osg::CopyOp& copyop) const override {
+        auto* d = new ScreenSsboDrawDrawable();
+        d->cache_ = cache_;
+        (void)copyop;
+        return d;
+    }
+    bool isSameKindAs(const osg::Object* obj) const override {
+        return dynamic_cast<const ScreenSsboDrawDrawable*>(obj) != nullptr;
+    }
+    const char* libraryName() const override { return "gsplat_osg_app"; }
+    const char* className() const override { return "ScreenSsboDrawDrawable"; }
+
+protected:
+    ~ScreenSsboDrawDrawable() override = default;
+
+private:
+    app::GlScreenGaussianCache* cache_ = nullptr;
+};
+
+osg::ref_ptr<osg::Node> buildScreenSsboSceneNode(app::GlScreenGaussianCache& cache) {
+    osg::ref_ptr<ScreenSsboDrawDrawable> draw = new ScreenSsboDrawDrawable();
+    draw->setCache(&cache);
+    osg::ref_ptr<osg::Geode> geode = new osg::Geode();
+    geode->addDrawable(draw.get());
+    osg::StateSet* ss = geode->getOrCreateStateSet();
+    ss->setMode(GL_LIGHTING, osg::StateAttribute::OFF | osg::StateAttribute::OVERRIDE);
+    return geode;
+}
+
 /// 导出真值与截图：保存参数、渲染 PNG、做回放对比。
-void runTruthCapture(PreviewState* state, const osg::Matrixd& V, const osg::Matrixd& P, int vp_w, int vp_h,
-                     bool do_png, const gsplat::Camera* frozen_cam, int frozen_w, int frozen_h) {
-    if (!state || !state->raster) return;
+void runTruthCapture(PreviewState* state, osg::State* gl_state, const osg::Matrixd& V, const osg::Matrixd& P,
+                     int vp_w, int vp_h, bool do_png, const gsplat::Camera* frozen_cam, int frozen_w,
+                     int frozen_h, bool reuse_screen_buffers) {
+    if (!state || !state->raster || !gl_state) return;
+
+    const osg::Matrixd& P_use = P;
 
     double view_a[16], proj_a[16];
     osgMatrixToArray(V, view_a);
-    osgMatrixToArray(P, proj_a);
+    osgMatrixToArray(P_use, proj_a);
 
     gsplat::Camera gcam;
     int cap_w = std::max(1, vp_w);
     int cap_h = std::max(1, vp_h);
+    int snap_mat_mode = state->last_mat_mode;
+    double view_gl[16];
+    double proj_gl[16];
     if (frozen_cam && frozen_w > 0 && frozen_h > 0) {
         gcam = *frozen_cam;
         cap_w = frozen_w;
         cap_h = frozen_h;
+        if (state->have_last_mats) {
+            std::memcpy(view_gl, state->last_view, sizeof(view_gl));
+            std::memcpy(proj_gl, state->last_proj, sizeof(proj_gl));
+        } else {
+            std::memcpy(view_gl, view_a, sizeof(view_gl));
+            std::memcpy(proj_gl, proj_a, sizeof(proj_gl));
+        }
         std::cout << "[OSG APP] capture uses preview camera " << cap_w << "x" << cap_h << "\n";
     } else {
         updateScaleForSnapshot(V, state->scene_center, state->raster, state->scale_modifier);
-        buildCameraFromSnapshot(V, P, state->scene_center, gcam);
-        previewRenderDims(vp_w, vp_h, state->raster->numGaussians(), cap_w, cap_h);
+        buildCameraFromSnapshot(V, P_use, state->scene_center, gcam, &snap_mat_mode, state->source_cloud);
+        previewRenderDims(vp_w, vp_h, state->gl_screen_cache.sourceCount(), cap_w, cap_h);
+        std::memcpy(view_gl, view_a, sizeof(view_gl));
+        std::memcpy(proj_gl, proj_a, sizeof(proj_gl));
     }
 
     const int idx = state->capture_idx++;
@@ -424,18 +443,55 @@ void runTruthCapture(PreviewState* state, const osg::Matrixd& V, const osg::Matr
     const std::string cli_path = "truth_cli_" + std::to_string(idx) + ".png";
 
     int visible = 0;
+    const bool can_reuse = reuse_screen_buffers && state->gl_screen_cache.ssboReady() &&
+                           state->gl_screen_cache.filledCount() > 0 &&
+                           state->gl_screen_cache.width() == cap_w && state->gl_screen_cache.height() == cap_h;
+    if (can_reuse && state->have_last_ssbo_gcam) {
+        // Reused SSBO must be rendered with the camera that produced that SSBO frame.
+        gcam = state->last_ssbo_gcam;
+    }
+    const gsplat::Status prep_st = unpackGlScreenCache(state->gl_screen_cache);
+    if (prep_st == gsplat::Status::Ok && state->gl_screen_cache.hasSsboCamera()) {
+        gcam = state->gl_screen_cache.ssboCamera();
+    } else if (can_reuse && state->have_last_ssbo_gcam) {
+        gcam = state->last_ssbo_gcam;
+    }
+    if (can_reuse) {
+        std::cout << "[OSG APP] capture reuses screen SSBO from main draw (" << cap_w << "x" << cap_h
+                  << ") filled=" << state->gl_screen_cache.filledCount() << "\n";
+    }
+    const gsplat::DeviceGaussianBuffers& screen_buf = state->gl_screen_cache.deviceBuffers();
     if (do_png) {
-        const gsplat::Status cap_st = state->raster->renderToPng(gcam, cap_w, cap_h, capture_path);
-        visible = (cap_st == gsplat::Status::Ok) ? state->raster->lastVisibleCount() : 0;
-        if (cap_st == gsplat::Status::Ok) {
+        const size_t rgb_bytes = static_cast<size_t>(cap_w) * static_cast<size_t>(cap_h) * 3u;
+        const int hud_min_visible = std::max(500, screen_buf.count / 20);
+        // Strict same-frame policy: never reuse previous RGB output for capture.
+        const bool snap_hud = false;
+        gsplat::Status cap_st = gsplat::Status::ErrorRenderFailed;
+        if (snap_hud && gsplat::writeRgbPng(capture_path, cap_w, cap_h, state->last_rgb)) {
+            cap_st = gsplat::Status::Ok;
+            visible = state->last_raster_visible;
             std::cout << "[OSG APP] wrote " << capture_path << " (" << cap_w << "x" << cap_h
-                      << ") visible=" << visible << "\n";
+                      << ") splats=" << screen_buf.count << " raster_visible=" << visible
+                      << " (HUD preview rgb)\n";
         } else {
-            std::cout << "[OSG APP] capture failed: " << gsplat::statusString(cap_st) << "\n";
+            cap_st = (prep_st == gsplat::Status::Ok)
+                         ? state->raster->renderToPng(gcam, cap_w, cap_h, screen_buf, capture_path)
+                         : prep_st;
+            visible = (cap_st == gsplat::Status::Ok) ? state->raster->lastVisibleCount() : 0;
+            if (cap_st == gsplat::Status::Ok) {
+                std::cout << "[OSG APP] wrote " << capture_path << " (" << cap_w << "x" << cap_h
+                          << ") splats=" << screen_buf.count << " raster_visible=" << visible
+                          << (can_reuse ? " (reused screen buf)" : "") << "\n";
+            } else {
+                std::cout << "[OSG APP] capture failed: " << gsplat::statusString(cap_st) << "\n";
+            }
         }
     } else {
         std::vector<uint8_t> rgb;
-        const gsplat::Status st = state->raster->render(gcam, cap_w, cap_h, rgb);
+        const gsplat::Status st =
+            (prep_st == gsplat::Status::Ok)
+                ? state->raster->render(gcam, cap_w, cap_h, screen_buf, rgb)
+                : prep_st;
         visible = (st == gsplat::Status::Ok) ? state->raster->lastVisibleCount() : 0;
         if (st != gsplat::Status::Ok) {
             std::cout << "[OSG APP] truth render failed: " << gsplat::statusString(st) << "\n";
@@ -445,13 +501,13 @@ void runTruthCapture(PreviewState* state, const osg::Matrixd& V, const osg::Matr
     CameraTruth truth;
     truth.width = cap_w;
     truth.height = cap_h;
-    truth.mat_mode = -1;
+    truth.mat_mode = snap_mat_mode;
     truth.proj_mul_pv = false;
     truth.scale_modifier = state->scale_modifier;
     truth.dc_only = state->raster->settings().dc_only;
     truth.drop_sh_rest = true;
     truth.min_opacity = 0.002f;
-    truth.visible = visible;
+    truth.visible = screen_buf.count;
     std::memcpy(truth.osg_view, view_a, sizeof(view_a));
     std::memcpy(truth.osg_proj, proj_a, sizeof(proj_a));
     truth.sdk = gcam;
@@ -463,7 +519,7 @@ void runTruthCapture(PreviewState* state, const osg::Matrixd& V, const osg::Matr
     }
 
     gsplat::Camera rebuilt;
-    buildCameraFromSnapshot(V, P, state->scene_center, rebuilt);
+    buildCameraFromSnapshot(V, P_use, state->scene_center, rebuilt, nullptr, state->source_cloud);
     double sdk_view[16], sdk_proj[16], reb_view[16], reb_proj[16];
     for (int i = 0; i < 16; ++i) {
         sdk_view[i] = static_cast<double>(gcam.view[i]);
@@ -477,7 +533,12 @@ void runTruthCapture(PreviewState* state, const osg::Matrixd& V, const osg::Matr
     CameraTruth loaded;
     if (loadCameraTruth(truth_path, loaded)) {
         applyTruthRenderSettings(*state->raster, loaded);
-        const gsplat::Status cli_st = state->raster->renderToPng(loaded.sdk, cap_w, cap_h, cli_path);
+        const gsplat::Status cli_prep = unpackGlScreenCache(state->gl_screen_cache);
+        const gsplat::Status cli_st =
+            (cli_prep == gsplat::Status::Ok)
+                ? state->raster->renderToPng(loaded.sdk, cap_w, cap_h, state->gl_screen_cache.deviceBuffers(),
+                                             cli_path)
+                : cli_prep;
         if (cli_st == gsplat::Status::Ok) {
             std::cout << "[OSG APP] truth_cli replay -> " << cli_path << " visible="
                       << state->raster->lastVisibleCount() << "\n";
@@ -552,6 +613,42 @@ void updatePreviewTexture(PreviewState& st, int w, int h, const std::vector<uint
 
 }
 
+#ifdef _WIN32
+/// IME/组合键产生的异常 KEY 事件（在 EventHandler 链中吞掉，减轻误触发）。
+static bool isImeOrNonAsciiKeyEvent(const osgGA::GUIEventAdapter& ea) {
+    const int key = ea.getKey();
+    if (key <= 0) {
+        return true;
+    }
+    if (key > 255) {
+        return true;
+    }
+    if (key == 229) {
+        return true;
+    }
+    return false;
+}
+#endif
+
+/// 先于 InteractionHandler 注册（OSG 逆序调用）：吞掉 IME 相关按键，避免进入操纵器。
+class ImeKeyFilterHandler : public osgGA::GUIEventHandler {
+public:
+    bool handle(const osgGA::GUIEventAdapter& ea, osgGA::GUIActionAdapter& aa) override {
+        (void)aa;
+#ifdef _WIN32
+        if (ea.getEventType() == osgGA::GUIEventAdapter::KEYDOWN ||
+            ea.getEventType() == osgGA::GUIEventAdapter::KEYUP) {
+            if (isImeOrNonAsciiKeyEvent(ea)) {
+                return true;
+            }
+        }
+#else
+        (void)ea;
+#endif
+        return false;
+    }
+};
+
 /// 交互事件处理：键盘控制预览与截图、鼠标状态追踪。
 class InteractionHandler : public osgGA::GUIEventHandler {
 
@@ -585,8 +682,16 @@ public:
 
             break;
 
-        case osgGA::GUIEventAdapter::KEYDOWN:
-
+        case osgGA::GUIEventAdapter::KEYDOWN: {
+#ifdef _WIN32
+            if (isImeOrNonAsciiKeyEvent(ea)) {
+                return true;
+            }
+#endif
+            const int mod = ea.getModKeyMask();
+            if (mod & osgGA::GUIEventAdapter::MODKEY_ALT) {
+                return false;
+            }
             if (ea.getKey() == 'p' || ea.getKey() == 'P') {
 
                 state_->preview_enabled = !state_->preview_enabled;
@@ -621,19 +726,19 @@ public:
                 return true;
             }
             if (ea.getKey() == ']') {
-                state_->scale_modifier = std::min(0.5f, state_->scale_modifier * 1.25f);
+                state_->scale_modifier = std::min(2.0f, state_->scale_modifier * 1.25f);
                 state_->force_render = true;
                 std::cout << "[OSG APP] scale_modifier=" << state_->scale_modifier << "\n";
                 return true;
             }
             if (ea.getKey() == '0') {
-                state_->scale_modifier = 0.03f;
+                state_->scale_modifier = 0.015f;
                 state_->force_render = true;
                 std::cout << "[OSG APP] scale_modifier reset=" << state_->scale_modifier << "\n";
                 return true;
             }
-
             break;
+        }
 
         default:
 
@@ -665,7 +770,9 @@ public:
 
     void operator()(osg::RenderInfo& renderInfo) const override {
 
-        if (!state_ || !state_->raster) return;
+        if (!state_) return;
+
+        if (!state_->raster) return;
 
         const bool want_capture = state_->pending_capture || state_->pending_truth_dump;
         if (!state_->preview_enabled && !want_capture) return;
@@ -686,8 +793,7 @@ public:
         osg::Matrixd P;
         int vp_w = 1280;
         int vp_h = 720;
-        const char* mats_source = "none";
-        if (!getDrawMatrices(renderInfo, cam, V, P, vp_w, vp_h, mats_source)) return;
+        if (!getDrawMatrices(renderInfo, cam, V, P, vp_w, vp_h)) return;
 
         GLint gl_vp[4] = {0, 0, 0, 0};
         glGetIntegerv(GL_VIEWPORT, gl_vp);
@@ -698,16 +804,6 @@ public:
 
         const bool do_capture_png = state_->pending_capture;
         const bool do_capture_truth = state_->pending_truth_dump;
-        if (do_capture_png || do_capture_truth) {
-            std::cout << "[TRUTH] draw matrix source=" << mats_source << "\n";
-            if (osg::State* st_state = renderInfo.getState()) {
-                logProjNearFar("state_proj", st_state->getProjectionMatrix());
-            } else {
-                std::cout << "[TRUTH] state_proj unavailable\n";
-            }
-            logProjNearFar("camera_proj", cam->getProjectionMatrix());
-            logProjNearFar("used_proj", P);
-        }
 
         double view_a[16], proj_a[16];
 
@@ -731,72 +827,78 @@ public:
 
 
 
-        if (state_->interacting && !state_->force_render) {
+        const bool must_capture = do_capture_png || do_capture_truth;
 
+        if (state_->interacting && !state_->force_render && !must_capture) {
             return;
-
         }
 
-        if (!mats_changed && !state_->force_render && !state_->last_rgb.empty()) {
-
+        if (!must_capture && !mats_changed && !state_->force_render && !state_->last_rgb.empty()) {
             return;
-
         }
 
-        if (throttle && !state_->last_rgb.empty()) {
-
+        if (!must_capture && throttle && !state_->last_rgb.empty()) {
             return;
-
         }
 
 
 
         int rw = vp_w;
-
         int rh = vp_h;
+        if (state_->gl_screen_cache.ssboReady() && state_->gl_screen_cache.width() > 0 &&
+            state_->gl_screen_cache.height() > 0) {
+            rw = state_->gl_screen_cache.width();
+            rh = state_->gl_screen_cache.height();
+        } else {
+            previewRenderDims(vp_w, vp_h, state_->gl_screen_cache.sourceCount(), rw, rh);
+        }
 
-        previewRenderDims(vp_w, vp_h, state_->raster->numGaussians(), rw, rh);
-
-
-
-        gsplat::Camera gcam;
-        updateScaleForSnapshot(V, state_->scene_center, state_->raster, state_->scale_modifier);
-        buildCameraFromSnapshot(V, P, state_->scene_center, gcam);
-
-
+        gsplat::Camera gcam{};
+        osg::State* gl_state = renderInfo.getState();
 
         std::vector<uint8_t> rgb;
-        gsplat::Status st = state_->raster->render(gcam, rw, rh, rgb);
-        int visible = (st == gsplat::Status::Ok) ? state_->raster->lastVisibleCount() : 0;
+        const gsplat::Status prep_st =
+            gl_state ? unpackGlScreenCache(state_->gl_screen_cache) : gsplat::Status::ErrorRenderFailed;
+        if (prep_st == gsplat::Status::Ok && state_->gl_screen_cache.hasSsboCamera()) {
+            gcam = state_->gl_screen_cache.ssboCamera();
+            state_->last_ssbo_gcam = gcam;
+            state_->have_last_ssbo_gcam = true;
+        } else {
+            updateScaleForSnapshot(V, state_->scene_center, state_->raster, state_->scale_modifier);
+            buildCameraFromSnapshot(V, P, state_->scene_center, gcam, &state_->last_mat_mode, state_->source_cloud);
+        }
+        const gsplat::DeviceGaussianBuffers& screen_buf = state_->gl_screen_cache.deviceBuffers();
+        const gsplat::Status st =
+            (prep_st == gsplat::Status::Ok) ? state_->raster->render(gcam, rw, rh, screen_buf, rgb) : prep_st;
+        const int ssbo_filled = (prep_st == gsplat::Status::Ok) ? state_->gl_screen_cache.filledCount() : 0;
+        const int raster_visible = (st == gsplat::Status::Ok) ? state_->raster->lastVisibleCount() : 0;
 
         if (st != gsplat::Status::Ok) {
-            if (do_capture_png || do_capture_truth) {
-                state_->pending_capture = do_capture_png;
-                state_->pending_truth_dump = do_capture_truth;
-                if (state_->have_last_gcam) {
-                    state_->pending_capture = false;
-                    state_->pending_truth_dump = false;
-                    runTruthCapture(state_, V, P, vp_w, vp_h, do_capture_png, &state_->last_gcam,
-                                    state_->last_w, state_->last_h);
-                } else {
-                    std::cout << "[OSG APP] capture skipped: preview render failed\n";
-                }
+            if (!state_->logged_prep_fail) {
+                state_->logged_prep_fail = true;
+                std::cerr << "[OSG APP] preview failed: prep=" << gsplat::statusString(prep_st)
+                          << " render=" << gsplat::statusString(st) << "\n";
             }
-            return;
-        }
-        if (visible <= 0) {
-            state_->zero_visible_streak++;
             if (do_capture_png || do_capture_truth) {
                 state_->pending_capture = false;
                 state_->pending_truth_dump = false;
-                if (state_->have_last_gcam) {
-                    runTruthCapture(state_, V, P, vp_w, vp_h, do_capture_png, &state_->last_gcam,
-                                    state_->last_w, state_->last_h);
-                } else {
-                    // 首帧或无历史结果时也强制落盘，避免 R/T 没有任何输出文件。
-                    std::cout << "[OSG APP] visible=0, capturing current frame anyway\n";
-                    runTruthCapture(state_, V, P, vp_w, vp_h, do_capture_png, &gcam, rw, rh);
-                }
+                runTruthCapture(state_, gl_state, V, P, vp_w, vp_h, do_capture_png, &gcam, rw, rh, false);
+            }
+            return;
+        }
+        if (raster_visible <= 0) {
+            state_->zero_visible_streak++;
+            if (state_->zero_visible_streak == 1) {
+                std::cerr << "[OSG APP] CUDA raster visible=0 (ssbo_filled=" << ssbo_filled
+                          << " P=" << screen_buf.count << " " << rw << "x" << rh
+                          << " scale_mod=" << state_->scale_modifier << " prep="
+                          << gsplat::statusString(prep_st) << ")\n";
+            }
+            if (do_capture_png || do_capture_truth) {
+                state_->pending_capture = false;
+                state_->pending_truth_dump = false;
+                std::cout << "[OSG APP] visible=0, capturing current frame anyway\n";
+                runTruthCapture(state_, gl_state, V, P, vp_w, vp_h, do_capture_png, &gcam, rw, rh, false);
                 return;
             }
             if (!state_->last_rgb.empty()) {
@@ -809,6 +911,7 @@ public:
         }
 
         state_->last_rgb = std::move(rgb);
+        state_->last_raster_visible = raster_visible;
 
         state_->last_w = rw;
 
@@ -831,12 +934,12 @@ public:
         if (do_capture_png || do_capture_truth) {
             state_->pending_capture = false;
             state_->pending_truth_dump = false;
-            const gsplat::Camera* cap_cam =
-                (visible > 0) ? &gcam : (state_->have_last_gcam ? &state_->last_gcam : nullptr);
-            const int cap_w = (visible > 0) ? rw : state_->last_w;
-            const int cap_h = (visible > 0) ? rh : state_->last_h;
+            const gsplat::Camera* cap_cam = &gcam;
+            const int cap_w = rw;
+            const int cap_h = rh;
             if (cap_cam && cap_w > 0 && cap_h > 0) {
-                runTruthCapture(state_, V, P, vp_w, vp_h, do_capture_png, cap_cam, cap_w, cap_h);
+                runTruthCapture(state_, gl_state, V, P, vp_w, vp_h, do_capture_png, cap_cam, cap_w, cap_h,
+                                true);
             } else {
                 std::cout << "[OSG APP] capture skipped: no valid preview camera\n";
             }
@@ -848,8 +951,10 @@ public:
 
             state_->logged_first_render = true;
 
-            std::cout << "[OSG APP] SDK preview " << rw << "x" << rh << " (viewport " << vp_w << "x" << vp_h
-                      << ", 1:1), visible ~" << visible << " / " << state_->raster->numGaussians()
+            std::cout << "[OSG APP] SDK Inria raster " << rw << "x" << rh << " visible=" << raster_visible
+                      << " ssbo_filled=" << ssbo_filled << " (viewport " << vp_w << "x" << vp_h
+                      << ", 1:1), raster_visible=" << raster_visible << " ssbo_filled=" << ssbo_filled
+                      << " / " << state_->gl_screen_cache.sourceCount() << " mat_mode=" << state_->last_mat_mode
                       << "\n";
 
         }
@@ -964,6 +1069,7 @@ void sceneBounds(const std::vector<gsplat::Gaussian>& g, osg::Vec3d& center, dou
 
 /// OSG app 主入口：加载高斯、初始化 viewer，并在 PostDraw 中驱动 SDK 预览。
 int main(int argc, char** argv) {
+    std::cout << "[OSG APP] starting...\n" << std::flush;
     std::string ply;
     size_t max_points = 1200000;
     if (!parseCli(argc, argv, ply, max_points)) {
@@ -1002,6 +1108,17 @@ int main(int argc, char** argv) {
     if (!gsplat::isCudaAvailable()) {
 
         std::cerr << "[OSG APP] CUDA not available — SDK preview disabled.\n";
+#ifdef GSPLAT_CUDA_ENABLED
+        int dev_count = 0;
+        const cudaError_t ce = cudaGetDeviceCount(&dev_count);
+        const char* ce_msg = cudaGetErrorString(ce);
+        const char* ce_name = cudaGetErrorName(ce);
+        std::cerr << "[OSG APP] cudaGetDeviceCount: " << (ce_name ? ce_name : "?") << " (" << ce << ") devices="
+                  << dev_count << " — " << (ce_msg && ce_msg[0] ? ce_msg : "no message") << "\n";
+        if (ce == 35) {
+            std::cerr << "[OSG APP] err=35: CUDA 13 runtime vs driver CUDA 12.6 — update NVIDIA driver, or put C:\\cuda118\\bin\\cudart64_110.dll next to exe and rebuild linking cuda118 (see README).\n";
+        }
+#endif
 
     }
 
@@ -1016,23 +1133,24 @@ int main(int argc, char** argv) {
 
     raster.setSettings(rs);
 
-    if (raster.setGaussians(gaussians) != gsplat::Status::Ok) {
-
-        std::cerr << "Raster upload failed\n";
-
-        return 3;
-
-    }
-
-
-
     PreviewState preview;
 
     preview.raster = &raster;
+    preview.source_cloud = &gaussians;
     preview.scale_modifier = rs.scale_modifier;
 
     preview.scene_center = computeSceneCenter(gaussians);
+    {
+        osg::Vec3d bound_center;
+        double bound_radius = 10.0;
+        sceneBounds(gaussians, bound_center, bound_radius);
+        preview.scene_radius = std::max(bound_radius, 1.0);
+    }
 
+    if (!preview.gl_screen_cache.uploadSource(gaussians, rs.dc_only)) {
+        std::cerr << "GL source VBO upload failed\n";
+        return 3;
+    }
     preview.texture = new osg::Texture2D();
 
     preview.image = new osg::Image();
@@ -1043,39 +1161,42 @@ int main(int argc, char** argv) {
 
     preview.texture->setImage(preview.image.get());
 
-
+    osg::DisplaySettings* ds = osg::DisplaySettings::instance();
+    ds->setGLContextVersion("4.3");
 
     osgViewer::Viewer viewer;
 
-    viewer.setSceneData(buildPointNode(gaussians).get());
+    osg::ref_ptr<osg::Group> root = new osg::Group();
+    root->addChild(buildScreenSsboSceneNode(preview.gl_screen_cache).get());
+    viewer.setSceneData(root.get());
 
     auto* manip = new osgGA::TrackballManipulator();
     osg::Vec3d bound_center;
     double bound_radius = 10.0;
     sceneBounds(gaussians, bound_center, bound_radius);
+
+    if (bound_radius < 1e-6) bound_radius = 10.0;
+
     const double dist = bound_radius * 2.5;
     manip->setHomePosition(bound_center + osg::Vec3d(0, -dist, dist * 0.35), bound_center,
                            osg::Vec3d(0, 0, 1));
     viewer.setCameraManipulator(manip);
 
     viewer.addEventHandler(new InteractionHandler(&preview));
+    viewer.addEventHandler(new ImeKeyFilterHandler());
 
     viewer.setUpViewInWindow(100, 100, 1280, 720);
+    viewer.realize();
+#ifdef _WIN32
+    disableWindowsImeOnViewer(viewer);
+#endif
     viewer.home();
 
-
-
     viewer.addSlave(createHudCamera(preview.texture.get()), false);
-
-
-
     viewer.getCamera()->setPostDrawCallback(new SdkPostDrawCallback(&preview));
 
-
-
-    std::cout << "[OSG APP] roam with mouse; SDK preview updates when you release the mouse.\n";
-
-    std::cout << "[OSG APP] P=toggle preview, R=truth capture, T=truth dump only, [ / ] scale, 0=reset.\n";
+    std::cout << "[OSG APP] roam: P=preview, R=capture, T=truth json, [ ] scale, 0=reset scale.\n";
+    std::cout << "[OSG APP] CJK IME is disabled on the 3D window to prevent UI freeze.\n";
 
     return viewer.run();
 

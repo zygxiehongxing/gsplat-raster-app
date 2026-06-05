@@ -4,6 +4,8 @@
 
 配套 SDK：`../gsplat-raster-sdk`（独立仓库，无 OSG 依赖）。
 
+> **WIP 分支** `wip/ssbo-device-pool-pipeline`：当前默认走 **GL SSBO 屏缓存 → CUDA 子集**（实验路径，画质不如 master 上 App `9400f39` 的全量 `setGaussians`）。说明见 [`docs/BRANCH_WIP_SCREEN_CACHE.md`](docs/BRANCH_WIP_SCREEN_CACHE.md)。计划主路径改回 **GaussianDevicePool + filterVisible**。
+
 ## 职责划分
 
 | 层 | 仓库 | 做什么 |
@@ -59,11 +61,15 @@ REM 也支持反序: gsplat_osg_app 200000 scene.ply
 ```
 
 - 鼠标漫游：OSG 点云预览（左下角小窗为 SDK 光栅化结果）
+- **3D 窗口已禁用 Win32 中文/日文 IME**（避免输入法消息导致界面卡死）；热键仍为 `P`/`R`/`T`/`[`/`]`/`0`
 - **松开鼠标**后：用当前 OSG `view/proj` 矩阵调用 SDK 更新预览（拖动中不重复渲染，避免卡顿）
 - `P`：开关 SDK 实时预览
 - `R`：真值对齐截图（同帧写出 `camera_truth_N.json`、`capture_N.png`、`truth_cli_N.png`）
 - `T`：只写 `camera_truth_N.json` + 进程内 `truth_cli_N.png` 复现（不写 `capture_*.png`）
-- `[` / `]` / `0`：调节 `scale_modifier`
+- `[` / `]` / `0`：调节 `scale_modifier`（默认约 `0.02`，比早期 `0.05` 更小以减少 CUDA 大块）
+- 环境变量 `GSPLAT_SCREEN_SCALE_MUL`（默认 `0.035`）：SSBO 解包时再缩小屏幕高斯尺度
+- 环境变量 `GSPLAT_SCREEN_MAX_OPACITY`（默认 `0.65`）：限制 SSBO 路径不透明度，减轻叠层糊块
+- 环境变量 `GSPLAT_DIAG_SSBO=1`：每 30 帧打印 SSBO cell 与 mean 重投影偏差（`[CACHE-SSBO-MAP]`）
 
 ### 真值对齐（ground truth）
 
@@ -83,4 +89,4 @@ build\gsplat_render_ply scene.ply truth_offline.png 1280 720 1200000 --truth cam
 
 控制台会打印 `sdk_view` vs `rebuilt_view` 矩阵最大差；若 `capture` 与 `truth_cli` 一致但和 OSG 画面仍不同，问题在矩阵 packing 或高斯解释，而非抓帧时机。
 
-相机矩阵走 `buildCameraFromOsg()`（Inria 约定：`view` + `proj=V×P_inria`，无多模式探测）。
+相机矩阵走 `buildCameraFromOsg()`（与 GL 相同：`view`=OSG view，`proj`=列主序 `P×V`，不做额外翻转/探测）。

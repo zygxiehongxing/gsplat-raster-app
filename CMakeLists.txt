@@ -1,16 +1,48 @@
 cmake_minimum_required(VERSION 3.20)
-project(gsplat-raster-app VERSION 1.0.0 LANGUAGES CXX)
 
-set(CMAKE_CXX_STANDARD 17)
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(GSPLAT_SDK_ROOT "${CMAKE_SOURCE_DIR}/../gsplat-raster-sdk" CACHE PATH "Path to gsplat-raster-sdk project")
+
+option(GSPLAT_USE_CUDA_TOOLCHAIN "Use cuda118 nvcc (VS2026 + driver-matched CUDA 11.8 runtime)" OFF)
+if(NOT GSPLAT_USE_CUDA_TOOLCHAIN AND WIN32 AND EXISTS "C:/cuda118/bin/nvcc.exe")
+    set(GSPLAT_USE_CUDA_TOOLCHAIN ON CACHE BOOL "" FORCE)
+endif()
 
 if(GSPLAT_USE_CUDA_TOOLCHAIN)
     include("${GSPLAT_SDK_ROOT}/cmake/cuda_compiler_cache.cmake")
 endif()
 
+project(gsplat-raster-app VERSION 1.0.0 LANGUAGES CXX)
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+# Copy vcpkg + CUDA runtime DLLs next to executables (Windows loader does not search vcpkg bin).
+function(gsplat_copy_runtime_dlls target)
+    if(NOT WIN32)
+        return()
+    endif()
+    set(_vcpkg_bin "")
+    if(DEFINED VCPKG_INSTALLED_DIR AND DEFINED VCPKG_TARGET_TRIPLET)
+        set(_vcpkg_bin "${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/bin")
+    endif()
+    set(_cuda_bin "")
+    if(DEFINED CUDAToolkit_BIN_DIR AND EXISTS "${CUDAToolkit_BIN_DIR}")
+        set(_cuda_bin "${CUDAToolkit_BIN_DIR}")
+    elseif(DEFINED CUDAToolkit_LIBRARY_DIR)
+        get_filename_component(_cuda_bin "${CUDAToolkit_LIBRARY_DIR}/../bin" ABSOLUTE)
+    endif()
+    add_custom_command(TARGET ${target} POST_BUILD
+        COMMAND ${CMAKE_COMMAND}
+            -DVCPKG_BIN=${_vcpkg_bin}
+            -DCUDA_BIN=${_cuda_bin}
+            -DDEST=$<TARGET_FILE_DIR:${target}>
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/copy_runtime_dlls.cmake"
+        VERBATIM
+    )
+endfunction()
+
 option(GSPLAT_BUILD_RENDER_PLY "Build CLI render app" ON)
 option(GSPLAT_BUILD_OSG_APP "Build OSG roaming app" ON)
-set(GSPLAT_SDK_ROOT "${CMAKE_SOURCE_DIR}/../gsplat-raster-sdk" CACHE PATH "Path to gsplat-raster-sdk project")
 
 if(NOT EXISTS "${GSPLAT_SDK_ROOT}/CMakeLists.txt")
     message(FATAL_ERROR "GSPLAT_SDK_ROOT not found: ${GSPLAT_SDK_ROOT}")
@@ -25,15 +57,7 @@ if(GSPLAT_BUILD_RENDER_PLY)
         ${CMAKE_SOURCE_DIR}/src/ply_loader_local.cpp
     )
     target_link_libraries(gsplat_render_ply PRIVATE gsplat_raster)
-    if(WIN32 AND CUDAToolkit_BIN_DIR)
-        file(GLOB _cudart_dll "${CUDAToolkit_BIN_DIR}/cudart64_*.dll")
-        if(_cudart_dll)
-            add_custom_command(TARGET gsplat_render_ply POST_BUILD
-                COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                    "${_cudart_dll}" "$<TARGET_FILE_DIR:gsplat_render_ply>"
-            )
-        endif()
-    endif()
+    gsplat_copy_runtime_dlls(gsplat_render_ply)
 endif()
 
 if(GSPLAT_BUILD_OSG_APP)
@@ -68,24 +92,21 @@ if(GSPLAT_BUILD_OSG_APP)
     endif()
 
     if(_gsplat_osg_found)
+        find_package(OpenGL REQUIRED)
         add_executable(gsplat_osg_app
             ${CMAKE_SOURCE_DIR}/src/osg_viewer_main.cpp
+            ${CMAKE_SOURCE_DIR}/src/gl_screen_cache.cpp
             ${CMAKE_SOURCE_DIR}/src/camera_truth.cpp
             ${CMAKE_SOURCE_DIR}/src/ply_loader_local.cpp
         )
         if(_gsplat_osg_includes)
             target_include_directories(gsplat_osg_app PRIVATE ${_gsplat_osg_includes})
         endif()
-        target_link_libraries(gsplat_osg_app PRIVATE gsplat_raster ${_gsplat_osg_libs})
-        if(WIN32 AND CUDAToolkit_BIN_DIR)
-            file(GLOB _cudart_dll2 "${CUDAToolkit_BIN_DIR}/cudart64_*.dll")
-            if(_cudart_dll2)
-                add_custom_command(TARGET gsplat_osg_app POST_BUILD
-                    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                        "${_cudart_dll2}" "$<TARGET_FILE_DIR:gsplat_osg_app>"
-                )
-            endif()
+        target_link_libraries(gsplat_osg_app PRIVATE gsplat_raster ${_gsplat_osg_libs} OpenGL::GL)
+        if(WIN32)
+            target_link_libraries(gsplat_osg_app PRIVATE imm32)
         endif()
+        gsplat_copy_runtime_dlls(gsplat_osg_app)
     else()
         message(WARNING "OpenSceneGraph not found (unofficial-osg/OpenSceneGraph), skip gsplat_osg_app")
     endif()
