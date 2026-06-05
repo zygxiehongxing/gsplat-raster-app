@@ -2,6 +2,7 @@
 
 #include "camera_truth.h"
 #include "gl_screen_cache.h"
+#include "gl_window_preview.h"
 #include "ply_loader_local.h"
 
 #include <osg/BlendFunc>
@@ -93,8 +94,6 @@ namespace {
 
 
 constexpr float kShC0 = 0.28209479177387814f;
-
-constexpr double kMinRenderIntervalSec = 0.12;
 
 
 
@@ -386,19 +385,10 @@ struct PreviewState {
     const std::vector<gsplat::Gaussian>* source_cloud = nullptr;
 
     app::GlScreenGaussianCache gl_screen_cache;
+    app::GlWindowPreview gpu_preview;
 
     osg::Vec3d scene_center;
     double scene_radius = 10.0;
-
-    osg::ref_ptr<osg::Texture2D> texture;
-
-    osg::ref_ptr<osg::Image> image;
-
-
-
-    std::vector<uint8_t> last_rgb;
-
-    std::vector<uint8_t> texture_rgb;
 
     int last_w = 0;
 
@@ -409,10 +399,6 @@ struct PreviewState {
     double last_proj[16] = {};
 
     bool have_last_mats = false;
-
-    double last_render_time_s = 0.0;
-
-
 
     bool preview_enabled = true;
 
@@ -637,66 +623,6 @@ void runTruthCapture(PreviewState* state, osg::State* gl_state, const osg::Matri
               << " <max_points> --truth " << truth_path << "\n";
 }
 
-/// 创建左下角 HUD 相机，用于显示 SDK 预览贴图。
-osg::ref_ptr<osg::Camera> createHudCamera(osg::Texture2D* tex) {
-
-    auto* hud = new osg::Camera();
-
-    hud->setReferenceFrame(osg::Transform::ABSOLUTE_RF);
-
-    hud->setViewMatrix(osg::Matrix::identity());
-
-    hud->setProjectionMatrix(osg::Matrix::ortho2D(0.0, 1.0, 0.0, 1.0));
-
-    hud->setRenderOrder(osg::Camera::POST_RENDER);
-
-    hud->setClearMask(GL_DEPTH_BUFFER_BIT);
-
-    hud->setAllowEventFocus(false);
-
-
-
-    auto* geode = new osg::Geode();
-
-    osg::ref_ptr<osg::Geometry> quad =
-
-        osg::createTexturedQuadGeometry(osg::Vec3(0.02f, 0.02f, 0.0f), osg::Vec3(0.46f, 0.0f, 0.0f),
-
-                                      osg::Vec3(0.0f, 0.46f, 0.0f));
-
-    auto* ss = quad->getOrCreateStateSet();
-
-    ss->setTextureAttributeAndModes(0, tex, osg::StateAttribute::ON);
-
-    ss->setMode(GL_LIGHTING, osg::StateAttribute::OFF);
-
-    ss->setMode(GL_BLEND, osg::StateAttribute::ON);
-
-    ss->setAttributeAndModes(new osg::BlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA));
-
-    geode->addDrawable(quad.get());
-
-    hud->addChild(geode);
-
-    return hud;
-
-}
-
-
-
-/// 更新 HUD 纹理内容。
-void updatePreviewTexture(PreviewState& st, int w, int h, const std::vector<uint8_t>& rgb) {
-
-    st.texture_rgb = rgb;
-
-    st.image->setImage(w, h, 1, GL_RGB, GL_RGB, GL_UNSIGNED_BYTE, st.texture_rgb.data(),
-
-                       osg::Image::NO_DELETE);
-
-    st.texture->setImage(st.image.get());
-
-}
-
 #ifdef _WIN32
 /// IME/组合键产生的异常 KEY 事件（在 EventHandler 链中吞掉，减轻误触发）。
 static bool isImeOrNonAsciiKeyEvent(const osgGA::GUIEventAdapter& ea) {
@@ -777,15 +703,10 @@ public:
                 return false;
             }
             if (ea.getKey() == 'p' || ea.getKey() == 'P') {
-
                 state_->preview_enabled = !state_->preview_enabled;
-
-                std::cout << "[OSG APP] SDK live preview " << (state_->preview_enabled ? "ON" : "OFF")
-
+                std::cout << "[OSG APP] CUDA window preview " << (state_->preview_enabled ? "ON" : "OFF")
                           << "\n";
-
                 return true;
-
             }
 
             if (ea.getKey() == 'r' || ea.getKey() == 'R') {
@@ -855,7 +776,7 @@ private:
 
 
 
-/// PostDraw 回调：按当前视角调用 SDK 渲染并刷新 HUD。
+/// PostDraw 回调：SSBO 点云绘制完成后每帧 unpack + CUDA 光栅，并刷新 HUD。
 class SdkPostDrawCallback : public osg::Camera::DrawCallback {
 
 public:
@@ -907,37 +828,7 @@ public:
 
         osgMatrixToArray(P, proj_a);
 
-        const bool mats_changed =
-
-            !state_->have_last_mats || !matricesEqual(view_a, state_->last_view) ||
-
-            !matricesEqual(proj_a, state_->last_proj);
-
-
-
-        const double now_s = osg::Timer::instance()->time_s();
-
-        const bool throttle =
-
-            !state_->force_render && (now_s - state_->last_render_time_s) < kMinRenderIntervalSec;
-
-
-
         const bool must_capture = do_capture_png || do_capture_truth;
-
-        if (state_->interacting && !state_->force_render && !must_capture) {
-            return;
-        }
-
-        if (!must_capture && !mats_changed && !state_->force_render && !state_->last_rgb.empty()) {
-            return;
-        }
-
-        if (!must_capture && throttle && !state_->last_rgb.empty()) {
-            return;
-        }
-
-
 
         int rw = vp_w;
         int rh = vp_h;
@@ -946,7 +837,6 @@ public:
         gsplat::Camera gcam{};
         osg::State* gl_state = renderInfo.getState();
 
-        std::vector<uint8_t> rgb;
         const gsplat::Status prep_st =
             gl_state ? unpackGlScreenCache(state_->gl_screen_cache) : gsplat::Status::ErrorRenderFailed;
         updateScaleForSnapshot(V, state_->scene_center, state_->raster, state_->scale_modifier);
@@ -955,7 +845,7 @@ public:
         auditRenderCamera(gcam, used_ssbo_cam, V, P, state_->scene_center, state_->source_cloud);
         const gsplat::DeviceGaussianBuffers& screen_buf = state_->gl_screen_cache.deviceBuffers();
         const gsplat::Status st =
-            (prep_st == gsplat::Status::Ok) ? state_->raster->render(gcam, rw, rh, screen_buf, rgb) : prep_st;
+            (prep_st == gsplat::Status::Ok) ? state_->raster->renderDevice(gcam, rw, rh, screen_buf) : prep_st;
         const int ssbo_filled = (prep_st == gsplat::Status::Ok) ? state_->gl_screen_cache.filledCount() : 0;
         const int raster_visible = (st == gsplat::Status::Ok) ? state_->raster->lastVisibleCount() : 0;
 
@@ -987,16 +877,12 @@ public:
                 runTruthCapture(state_, gl_state, V, P, vp_w, vp_h, do_capture_png, &gcam, rw, rh, false);
                 return;
             }
-            if (!state_->last_rgb.empty()) {
-                return;
-            }
         } else {
             state_->zero_visible_streak = 0;
             state_->last_gcam = gcam;
             state_->have_last_gcam = true;
         }
 
-        state_->last_rgb = std::move(rgb);
         state_->last_raster_visible = raster_visible;
 
         state_->last_w = rw;
@@ -1009,13 +895,38 @@ public:
 
         state_->have_last_mats = true;
 
-        state_->last_render_time_s = now_s;
-
         state_->force_render = false;
 
-
-
-        updatePreviewTexture(*state_, rw, rh, state_->last_rgb);
+        if (st == gsplat::Status::Ok && gl_state && state_->preview_enabled) {
+            const float* d_rgb = state_->raster->deviceRgbPlanar();
+            const int dev_w = state_->raster->deviceRgbWidth();
+            const int dev_h = state_->raster->deviceRgbHeight();
+            if (d_rgb && dev_w == rw && dev_h == rh) {
+                static bool logged_ensure_fail = false;
+                static bool logged_upload_fail = false;
+                static bool logged_draw_fail = false;
+                if (!state_->gpu_preview.ensure(gl_state, rw, rh)) {
+                    if (!logged_ensure_fail) {
+                        logged_ensure_fail = true;
+                        std::cerr << "[OSG APP] GPU preview texture/interop setup failed\n";
+                    }
+                } else if (!state_->gpu_preview.uploadPlanarRgb(d_rgb, rw, rh)) {
+                    if (!logged_upload_fail) {
+                        logged_upload_fail = true;
+                        std::cerr << "[OSG APP] GPU preview CUDA->texture upload failed\n";
+                    }
+                } else if (!state_->gpu_preview.drawFullscreen(gl_state, vp_w, vp_h)) {
+                    if (!logged_draw_fail) {
+                        logged_draw_fail = true;
+                        std::cerr << "[OSG APP] GPU preview fullscreen draw failed\n";
+                    }
+                } else if (!state_->logged_first_render) {
+                    state_->logged_first_render = true;
+                    std::cout << "[OSG APP] GPU direct preview " << rw << "x" << rh
+                              << " visible=" << raster_visible << " (no CPU readback)\n";
+                }
+            }
+        }
 
         if (do_capture_png || do_capture_truth) {
             state_->pending_capture = false;
@@ -1032,18 +943,6 @@ public:
         }
 
         if (!state_->preview_enabled) return;
-
-        if (!state_->logged_first_render) {
-
-            state_->logged_first_render = true;
-
-            std::cout << "[OSG APP] SDK Inria raster " << rw << "x" << rh << " visible=" << raster_visible
-                      << " ssbo_gpu=" << screen_buf.count << " filled=" << ssbo_filled << " / "
-                      << state_->gl_screen_cache.sourceCount() << " mat_mode=" << state_->last_mat_mode
-                      << " (viewport " << vp_w << "x" << vp_h << ")\n";
-
-        }
-
     }
 
 
@@ -1236,16 +1135,6 @@ int main(int argc, char** argv) {
         std::cerr << "GL source VBO upload failed\n";
         return 3;
     }
-    preview.texture = new osg::Texture2D();
-
-    preview.image = new osg::Image();
-
-    preview.image->allocateImage(4, 4, 1, GL_RGB, GL_UNSIGNED_BYTE);
-
-    std::memset(preview.image->data(), 0, 4 * 4 * 3);
-
-    preview.texture->setImage(preview.image.get());
-
     osg::DisplaySettings* ds = osg::DisplaySettings::instance();
     ds->setGLContextVersion("4.3");
 
@@ -1277,10 +1166,9 @@ int main(int argc, char** argv) {
 #endif
     viewer.home();
 
-    viewer.addSlave(createHudCamera(preview.texture.get()), false);
     viewer.getCamera()->setPostDrawCallback(new SdkPostDrawCallback(&preview));
 
-    std::cout << "[OSG APP] roam: P=preview, R=capture, T=truth json, [ - / ] = + scale, 0=reset.\n";
+    std::cout << "[OSG APP] roam: P=toggle CUDA preview, R=capture, T=truth json, [ - / ] = + scale, 0=reset.\n";
     std::cout << "[OSG APP] CJK IME is disabled on the 3D window to prevent UI freeze.\n";
 
     return viewer.run();

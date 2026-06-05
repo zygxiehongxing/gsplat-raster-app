@@ -96,6 +96,7 @@ if(GSPLAT_BUILD_OSG_APP)
         add_executable(gsplat_osg_app
             ${CMAKE_SOURCE_DIR}/src/osg_viewer_main.cpp
             ${CMAKE_SOURCE_DIR}/src/gl_screen_cache.cpp
+            ${CMAKE_SOURCE_DIR}/src/gl_window_preview.cpp
             ${CMAKE_SOURCE_DIR}/src/camera_truth.cpp
             ${CMAKE_SOURCE_DIR}/src/ply_loader_local.cpp
         )
@@ -103,6 +104,22 @@ if(GSPLAT_BUILD_OSG_APP)
             target_include_directories(gsplat_osg_app PRIVATE ${_gsplat_osg_includes})
         endif()
         target_link_libraries(gsplat_osg_app PRIVATE gsplat_raster ${_gsplat_osg_libs} OpenGL::GL)
+        if(CMAKE_CUDA_COMPILER)
+            if(NOT CMAKE_CUDA_COMPILER_LOADED)
+                enable_language(CUDA)
+            endif()
+            find_package(CUDAToolkit REQUIRED)
+            add_library(gsplat_osg_gl_preview OBJECT ${CMAKE_SOURCE_DIR}/src/gl_window_preview.cu)
+            target_include_directories(gsplat_osg_gl_preview PRIVATE ${CMAKE_SOURCE_DIR}/src)
+            target_include_directories(gsplat_osg_gl_preview PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
+            target_link_libraries(gsplat_osg_gl_preview PRIVATE CUDA::cudart)
+            target_compile_definitions(gsplat_osg_gl_preview PRIVATE GSPLAT_CUDA_ENABLED=1)
+            set_target_properties(gsplat_osg_gl_preview PROPERTIES
+                CUDA_SEPARABLE_COMPILATION OFF
+                POSITION_INDEPENDENT_CODE ON
+            )
+            target_link_libraries(gsplat_osg_app PRIVATE gsplat_osg_gl_preview)
+        endif()
         if(WIN32)
             target_link_libraries(gsplat_osg_app PRIVATE imm32)
         endif()
