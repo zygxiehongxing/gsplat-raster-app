@@ -96,6 +96,7 @@ void main() {
 
 const char* kFragSrc = R"GLSL(
 #version 430 core
+layout(early_fragment_tests) in;
 struct GaussianPixel {
     vec4 mean_opacity;
     vec4 scale_pad;
@@ -111,12 +112,12 @@ layout(std430, binding = 0) buffer ScreenGaussians {
     float meta_proj[16];
     vec4 cam_pos_tan;
     uvec4 info;
-    uint append_count;
-    uint _hdr_pad0;
-    uint _hdr_pad1;
-    uint _hdr_pad2;
     GaussianPixel cells[];
 };
+layout(location = 8) uniform int u_width;
+layout(location = 9) uniform int u_height;
+layout(location = 10) uniform int u_vp_x;
+layout(location = 11) uniform int u_vp_y;
 layout(location = 12) uniform int u_frame_id;
 in vec4 v_mean_opacity;
 in vec4 v_scale_pad;
@@ -124,16 +125,17 @@ in vec4 v_rot;
 in vec4 v_color_pad;
 out vec4 fragColor;
 void main() {
-    uint cap = info.y;
-    uint slot = atomicAdd(append_count, 1u);
-    if (slot >= cap) {
-        return;
+    int x = int(gl_FragCoord.x) - u_vp_x;
+    int y = int(gl_FragCoord.y) - u_vp_y;
+    if (x < 0 || y < 0 || x >= u_width || y >= u_height) {
+        discard;
     }
-    cells[slot].mean_opacity = v_mean_opacity;
-    cells[slot].scale_pad = v_scale_pad;
-    cells[slot].rot = v_rot;
-    cells[slot].color_pad = v_color_pad;
-    cells[slot].frame_id = uint(u_frame_id);
+    int idx = y * u_width + x;
+    cells[idx].mean_opacity = v_mean_opacity;
+    cells[idx].scale_pad = v_scale_pad;
+    cells[idx].rot = v_rot;
+    cells[idx].color_pad = v_color_pad;
+    cells[idx].frame_id = uint(u_frame_id);
     fragColor = vec4(v_color_pad.rgb, 1.0);
 }
 )GLSL";
@@ -280,14 +282,14 @@ static void diagnoseSsboList(const gsplat::ScreenCacheMetaGpu& meta, int render_
         }
     }
 
-    std::cout << "[CACHE-SSBO-LIST] frame=" << expected_frame_id << " filled=" << filled
+    std::cout << "[CACHE-SSBO-GRID] frame=" << expected_frame_id << " cells=" << filled
               << " frame_ok=" << frame_ok << " pos_opacity=" << pos_opacity << " clip_behind=" << clip_behind
-              << " capacity=" << meta.info[1] << " render=" << diag_w << "x" << diag_h << " vp=" << vp_x
-              << "," << vp_y << "\n";
+              << " grid=" << meta.info[1] << "x" << meta.info[2] << " render=" << diag_w << "x" << diag_h
+              << " vp=" << vp_x << "," << vp_y << "\n";
 }
 
 void fillSsboMetaCpu(gsplat::ScreenCacheMetaGpu& meta, const osg::Matrixd& view, const osg::Matrixd& proj,
-                     int render_w, int render_h, int vp_x, int vp_y, uint32_t frame_id, uint32_t capacity) {
+                     int render_w, int render_h, int vp_x, int vp_y, uint32_t frame_id) {
     osgMatrixToGlslRowMajor(view, meta.view_glsl);
     osgMatrixToGlslRowMajor(proj, meta.proj_glsl);
     osg::Matrixd invV;
@@ -306,28 +308,14 @@ void fillSsboMetaCpu(gsplat::ScreenCacheMetaGpu& meta, const osg::Matrixd& view,
         meta.cam_pos_tan[3] = 0.57735026f;
     }
     meta.info[0] = frame_id;
-    meta.info[1] = capacity;
-    meta.info[2] = 0u;
+    meta.info[1] = static_cast<uint32_t>(render_w);
+    meta.info[2] = static_cast<uint32_t>(render_h);
     meta.info[3] = gsplat::packScreenCacheViewport(vp_x, vp_y);
-    (void)render_w;
-    (void)render_h;
 }
 
 }  // namespace
 
-int GlScreenGaussianCache::resolveSsboCapacity() const {
-    int cap = static_cast<int>(gsplat::kDefaultScreenSsboCapacity);
-    const char* env = std::getenv("GSPLAT_SSBO_CAPACITY");
-    if (env && env[0] != '\0') {
-        const long v = std::strtol(env, nullptr, 10);
-        if (v > 0 && v <= 10000000L) {
-            cap = static_cast<int>(v);
-        }
-    }
-    return std::max(1, cap);
-}
-
-GlScreenGaussianCache::GlScreenGaussianCache() : ssbo_capacity_(resolveSsboCapacity()) {}
+GlScreenGaussianCache::GlScreenGaussianCache() = default;
 
 GlScreenGaussianCache::~GlScreenGaussianCache() { shutdown(); }
 
@@ -359,7 +347,7 @@ void GlScreenGaussianCache::destroyGl() {
 void GlScreenGaussianCache::shutdown() { destroyGl(); }
 
 bool GlScreenGaussianCache::compileProgram(osg::GLExtensions* ext) {
-    constexpr unsigned kShaderGen = 23u;
+    constexpr unsigned kShaderGen = 24u;
     if (program_ && program_shader_gen_ == kShaderGen) return true;
     if (program_ && ext && ext->glDeleteProgram) {
         ext->glDeleteProgram(program_);
@@ -524,21 +512,23 @@ bool GlScreenGaussianCache::ensureCudaInterop() {
 #endif
 }
 
-bool GlScreenGaussianCache::ensureScreenResources(osg::GLExtensions* ext) {
-    if (!ext || ssbo_capacity_ <= 0) return false;
-    ssbo_capacity_ = resolveSsboCapacity();
+bool GlScreenGaussianCache::ensureScreenResources(osg::GLExtensions* ext, int width, int height) {
+    if (!ext || width <= 0 || height <= 0) return false;
+    const bool size_changed = (width_ != width || height_ != height);
+    width_ = width;
+    height_ = height;
     if (!compileProgram(ext)) return false;
 
-    const size_t ssbo_bytes = sizeof(gsplat::ScreenSsboListHeaderGpu) +
-                              static_cast<size_t>(ssbo_capacity_) * sizeof(gsplat::GaussianPixelGpu);
-    if (!screen_ssbo_ || ssbo_clear_.size() != ssbo_bytes) {
+    const size_t ssbo_bytes = sizeof(gsplat::ScreenCacheMetaGpu) +
+                              static_cast<size_t>(width_) * static_cast<size_t>(height_) *
+                                  sizeof(gsplat::GaussianPixelGpu);
+    if (!screen_ssbo_ || size_changed) {
         destroyCudaInterop();
         if (screen_ssbo_ && ext->glDeleteBuffers) ext->glDeleteBuffers(1, &screen_ssbo_);
         ext->glGenBuffers(1, &screen_ssbo_);
         ext->glBindBuffer(GL_SHADER_STORAGE_BUFFER, screen_ssbo_);
         ext->glBufferData(GL_SHADER_STORAGE_BUFFER, static_cast<GLsizeiptr>(ssbo_bytes), nullptr, GL_DYNAMIC_DRAW);
         ext->glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
-        ssbo_clear_.assign(ssbo_bytes, 0);
     }
     return true;
 }
@@ -587,8 +577,6 @@ gsplat::Status GlScreenGaussianCache::drawPointsAndSsbo(osg::State* state, const
     osg::GLExtensions* ext = osg::GLExtensions::Get(gl_context_id_, true);
     if (!ext) return gsplat::Status::ErrorRenderFailed;
     if (!ensureSourceVbo(ext)) return gsplat::Status::ErrorNoGaussians;
-    if (!ensureScreenResources(ext)) return gsplat::Status::ErrorRenderFailed;
-
     GLint gl_vp[4] = {0, 0, 0, 0};
     glGetIntegerv(GL_VIEWPORT, gl_vp);
     const int vp_x = gl_vp[0];
@@ -597,25 +585,20 @@ gsplat::Status GlScreenGaussianCache::drawPointsAndSsbo(osg::State* state, const
         width = gl_vp[2];
         height = gl_vp[3];
     }
-    width_ = width;
-    height_ = height;
+    if (!ensureScreenResources(ext, width, height)) return gsplat::Status::ErrorRenderFailed;
 
     const uint32_t frame_id = ++frame_counter_;
-    const uint32_t capacity_u = static_cast<uint32_t>(ssbo_capacity_);
-    const size_t ssbo_bytes = sizeof(gsplat::ScreenSsboListHeaderGpu) +
-                              static_cast<size_t>(ssbo_capacity_) * sizeof(gsplat::GaussianPixelGpu);
-    if (ssbo_clear_.size() != ssbo_bytes) {
-        ssbo_clear_.assign(ssbo_bytes, 0);
-    }
-    auto* hdr = reinterpret_cast<gsplat::ScreenSsboListHeaderGpu*>(ssbo_clear_.data());
-    fillSsboMetaCpu(hdr->meta, view, proj, width_, height_, vp_x, vp_y, frame_id, capacity_u);
-    hdr->append_count = 0u;
-    hdr->_pad[0] = hdr->_pad[1] = hdr->_pad[2] = 0u;
+    gsplat::ScreenCacheMetaGpu meta{};
+    fillSsboMetaCpu(meta, view, proj, width_, height_, vp_x, vp_y, frame_id);
+    // 仅上传 meta；未命中格保留旧 frame_id，CUDA unpack 会将其 opacity 置 0（无需每帧清零 ~W×H 格）。
     ext->glBindBuffer(GL_SHADER_STORAGE_BUFFER, screen_ssbo_);
-    ext->glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, static_cast<GLsizeiptr>(ssbo_bytes), ssbo_clear_.data());
-    last_ssbo_meta_ = hdr->meta;
+    ext->glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, static_cast<GLsizeiptr>(sizeof(meta)), &meta);
+    last_ssbo_meta_ = meta;
 
-    glDisable(GL_DEPTH_TEST);
+    glClear(GL_DEPTH_BUFFER_BIT);
+    glEnable(GL_DEPTH_TEST);
+    glDepthFunc(GL_LESS);
+    glDepthMask(GL_TRUE);
     glEnable(GL_PROGRAM_POINT_SIZE);
     glDisable(GL_BLEND);
 
@@ -623,7 +606,15 @@ gsplat::Status GlScreenGaussianCache::drawPointsAndSsbo(osg::State* state, const
     uploadOsgMatrix(ext, kLocView, view);
     uploadOsgMatrix(ext, kLocProj, proj);
 
+    const int loc_w = ext->glGetUniformLocation(program_, "u_width");
+    const int loc_h = ext->glGetUniformLocation(program_, "u_height");
+    const int loc_vpx = ext->glGetUniformLocation(program_, "u_vp_x");
+    const int loc_vpy = ext->glGetUniformLocation(program_, "u_vp_y");
     const int loc_fid = ext->glGetUniformLocation(program_, "u_frame_id");
+    if (loc_w >= 0) ext->glUniform1i(loc_w, width_);
+    if (loc_h >= 0) ext->glUniform1i(loc_h, height_);
+    if (loc_vpx >= 0) ext->glUniform1i(loc_vpx, vp_x);
+    if (loc_vpy >= 0) ext->glUniform1i(loc_vpy, vp_y);
     if (loc_fid >= 0) ext->glUniform1i(loc_fid, static_cast<int>(frame_id));
 
     if (ext->glBindBufferBase) {
@@ -637,12 +628,10 @@ gsplat::Status GlScreenGaussianCache::drawPointsAndSsbo(osg::State* state, const
 
     glDrawArrays(GL_POINTS, 0, source_count_);
 
+    // SSBO 写入对本 context 后续操作可见；CUDA interop 前在 unpackSsboToDevice 里 glFinish。
     if (ext->glMemoryBarrier) {
         ext->glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
     }
-#ifdef GSPLAT_CUDA_ENABLED
-    glFinish();
-#endif
 
     if (vao_ && ext->glBindVertexArray) {
         ext->glBindVertexArray(0);
@@ -655,17 +644,9 @@ gsplat::Status GlScreenGaussianCache::drawPointsAndSsbo(osg::State* state, const
         ext->glBindBuffer(GL_ARRAY_BUFFER, 0);
     }
     ext->glUseProgram(0);
+    glDisable(GL_DEPTH_TEST);
 
-    uint32_t appended = 0u;
-    ext->glBindBuffer(GL_SHADER_STORAGE_BUFFER, screen_ssbo_);
-    ext->glGetBufferSubData(GL_SHADER_STORAGE_BUFFER, offsetof(gsplat::ScreenSsboListHeaderGpu, append_count),
-                            sizeof(appended), &appended);
-    ext->glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
-    if (appended > capacity_u) {
-        appended = capacity_u;
-    }
-    filled_count_ = static_cast<int>(appended);
-    last_ssbo_meta_.info[2] = appended;
+    filled_count_ = width_ * height_;
 
     ssbo_ready_ = true;
     last_ssbo_frame_id_ = frame_id;
@@ -673,7 +654,7 @@ gsplat::Status GlScreenGaussianCache::drawPointsAndSsbo(osg::State* state, const
 }
 
 gsplat::Status GlScreenGaussianCache::unpackSsboToDevice() {
-    if (!ssbo_ready_ || ssbo_capacity_ <= 0 || filled_count_ <= 0) return gsplat::Status::ErrorRenderFailed;
+    if (!ssbo_ready_ || width_ <= 0 || height_ <= 0) return gsplat::Status::ErrorRenderFailed;
 #ifndef GSPLAT_CUDA_ENABLED
     return gsplat::Status::ErrorNoCuda;
 #else
@@ -690,42 +671,37 @@ gsplat::Status GlScreenGaussianCache::unpackSsboToDevice() {
         cudaGraphicsUnmapResources(1, &res, 0);
         return gsplat::Status::ErrorRenderFailed;
     }
-    if (mapped_bytes < sizeof(gsplat::ScreenSsboListHeaderGpu)) {
+    if (mapped_bytes < sizeof(gsplat::ScreenCacheMetaGpu)) {
         cudaGraphicsUnmapResources(1, &res, 0);
         return gsplat::Status::ErrorRenderFailed;
     }
-    const auto* d_hdr = reinterpret_cast<const gsplat::ScreenSsboListHeaderGpu*>(d_raw);
+    const auto* d_meta = reinterpret_cast<const gsplat::ScreenCacheMetaGpu*>(d_raw);
     const auto* d_ptr =
         reinterpret_cast<const gsplat::GaussianPixelGpu*>(reinterpret_cast<const uint8_t*>(d_raw) +
-                                                          sizeof(gsplat::ScreenSsboListHeaderGpu));
-    gsplat::ScreenSsboListHeaderGpu h_hdr = {};
-    cudaMemcpy(&h_hdr, d_hdr, sizeof(h_hdr), cudaMemcpyDeviceToHost);
-    if (h_hdr.meta.info[0] == last_ssbo_frame_id_) {
-        last_ssbo_meta_ = h_hdr.meta;
-        gsplat::buildCameraFromSsboMeta(h_hdr.meta, ssbo_cam_);
+                                                          sizeof(gsplat::ScreenCacheMetaGpu));
+    gsplat::ScreenCacheMetaGpu h_meta = {};
+    cudaMemcpy(&h_meta, d_meta, sizeof(h_meta), cudaMemcpyDeviceToHost);
+    if (h_meta.info[0] == last_ssbo_frame_id_) {
+        last_ssbo_meta_ = h_meta;
+        gsplat::buildCameraFromSsboMeta(h_meta, ssbo_cam_);
         has_ssbo_cam_ = true;
     } else {
         has_ssbo_cam_ = false;
     }
-    int filled = filled_count_;
-    if (h_hdr.append_count > 0u) {
-        filled = static_cast<int>(std::min(h_hdr.append_count, h_hdr.meta.info[1]));
-        filled_count_ = filled;
-    }
 
-    if (diagSsboEnabled() && filled > 0) {
+    if (diagSsboEnabled() && has_ssbo_cam_) {
         static int diag_frame = 0;
         if ((diag_frame++ % 30) == 0) {
-            const int sample = std::min(filled, 8192);
-            std::vector<gsplat::GaussianPixelGpu> h_cells(static_cast<size_t>(sample));
-            if (cudaMemcpy(h_cells.data(), d_ptr, static_cast<size_t>(sample) * sizeof(gsplat::GaussianPixelGpu),
+            const int n = width_ * height_;
+            std::vector<gsplat::GaussianPixelGpu> h_cells(static_cast<size_t>(n));
+            if (cudaMemcpy(h_cells.data(), d_ptr, static_cast<size_t>(n) * sizeof(gsplat::GaussianPixelGpu),
                            cudaMemcpyDeviceToHost) == cudaSuccess) {
-                diagnoseSsboList(h_hdr.meta, width_, height_, sample, last_ssbo_frame_id_, h_cells.data());
+                diagnoseSsboList(h_meta, width_, height_, n, last_ssbo_frame_id_, h_cells.data());
             }
         }
     }
 
-    const gsplat::Status st = gsplat::unpackScreenSsboToDevice(d_ptr, ssbo_capacity_, filled, soa_, filled_count_,
+    const gsplat::Status st = gsplat::unpackScreenSsboToDevice(d_ptr, width_, height_, soa_, filled_count_,
                                                                last_ssbo_frame_id_);
     cudaDeviceSynchronize();
     cudaGraphicsUnmapResources(1, &res, 0);

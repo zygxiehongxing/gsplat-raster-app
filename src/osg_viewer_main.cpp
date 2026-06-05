@@ -439,7 +439,7 @@ struct PreviewState {
     int last_mat_mode = -1;
 };
 
-/// 一次 glDrawArrays：顶点着色器投影 + 片元写 SSBO 并输出颜色（无第二遍点云）。
+/// 一次 glDrawArrays：深度测试赢家片元写入 W×H SSBO 栅格。
 class ScreenSsboDrawDrawable : public osg::Drawable {
 public:
     ScreenSsboDrawDrawable() {
